@@ -1,0 +1,27 @@
+[package]
+name = "repoplane-worker"
+description = "The repoplane worker: leases tasks from the API over outbound HTTPS and talks to forges. Never opens a database."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "repoplane-worker"
+path = "src/main.rs"
+
+[dependencies]
+repoplane-proto.workspace = true
+repoplane-forge.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

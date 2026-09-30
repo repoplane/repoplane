@@ -1,0 +1,11 @@
+# repoplane-api configuration. Every credential is the NAME of an environment variable; the
+# file itself never holds a secret. Every key is optional; these are the defaults.
+listen: 127.0.0.1:8080
+database_url_env: REPOPLANE_DATABASE_URL   # postgres://user:password@host:5432/db
+admin:
+  token_env: REPOPLANE_ADMIN_TOKEN         # the CLI's and the enterprise plane's bearer token
+queues:
+  default:
+    token_env: REPOPLANE_WORKER_TOKEN      # presented by workers serving this queue
+  # bank-eu:                               # a queue served only by workers inside one network
+  #   token_env: REPOPLANE_BANK_EU_TOKEN

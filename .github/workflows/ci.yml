@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * *" # nightly: the three cloud sandboxes
+
+permissions:
+  contents: read
+
+jobs:
+  # Lint, unit tests, and the e2e suite on a Forgejo of its own: no secrets needed.
+  local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: repoplane/fleets
+          path: fleets
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: make ci
+        env:
+          REPOPLANE_FLEETS_DIR: ${{ github.workspace }}/fleets
+
+  # The same suite on the real sandboxes. It mutates them and puts them back with forgelab, so
+  # a sandbox is shared state: one run at a time per sandbox, across every branch.
+  sandbox:
+    needs: local
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        sandbox: [gh, gl, ado]
+    concurrency:
+      group: sandbox-${{ matrix.sandbox }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: repoplane/fleets
+          path: fleets
+      - uses: dtolnay/rust-toolchain@1.93
+      - uses: Swatinem/rust-cache@v2
+      - run: make e2e SANDBOX=${{ matrix.sandbox }}
+        env:
+          REPOPLANE_FLEETS_DIR: ${{ github.workspace }}/fleets
+          FORGELAB_GH_TOKEN: ${{ secrets.FORGELAB_GH_TOKEN }}
+          FORGELAB_GL_TOKEN: ${{ secrets.FORGELAB_GL_TOKEN }}
+          FORGELAB_ADO_TOKEN: ${{ secrets.FORGELAB_ADO_TOKEN }}

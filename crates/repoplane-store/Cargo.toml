@@ -1,0 +1,18 @@
+[package]
+name = "repoplane-store"
+description = "Postgres store and migrations for the repoplane API. Linked by the API only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+repoplane-proto.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tracing.workspace = true

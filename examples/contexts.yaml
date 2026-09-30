@@ -1,0 +1,8 @@
+# ~/.config/repoplane/contexts.yaml (or $REPOPLANE_CONFIG): which API the CLI talks to, and the
+# NAME of the variable holding its token. Shaped like forgelab's sandboxes.yaml.
+version: 1
+current: local
+contexts:
+  local:
+    api_url: http://127.0.0.1:8080
+    token_env: REPOPLANE_TOKEN
