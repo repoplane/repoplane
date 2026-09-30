@@ -225,11 +225,10 @@ impl AzureDevops {
                 archived: r.is_disabled,
                 // Azure DevOps has no topics at all, which is not the same as none set.
                 topics: None,
-                head: None,
+                // Ids rather than names: they need no escaping and survive a rename.
+                locator: format!("{}/{}", r.project.id, r.id),
                 web_url: r.web_url,
             },
-            // Ids rather than names: they need no escaping and survive a rename.
-            locator: format!("{}/{}", r.project.id, r.id),
         }
     }
 
@@ -243,10 +242,9 @@ impl AzureDevops {
         else {
             return Ok(None);
         };
-        let (project, repo) = r
-            .locator
-            .split_once('/')
-            .ok_or_else(|| ForgeError::protocol(FORGE, format!("locator {:?}", r.locator)))?;
+        let (project, repo) = r.snapshot.locator.split_once('/').ok_or_else(|| {
+            ForgeError::protocol(FORGE, format!("locator {:?}", r.snapshot.locator))
+        })?;
         let url = format!(
             "{}/{}/_apis/git/repositories/{}/refs?filter=heads/{}&{API_VERSION}",
             self.api,
@@ -317,11 +315,10 @@ mod tests {
                 default_branch: branch.map(str::to_string),
                 archived,
                 topics: None,
-                head: None,
+                locator: "p1/r1".into(),
                 empty: branch.is_none(),
                 web_url: None,
             },
-            locator: "p1/r1".into(),
         }
     }
 
@@ -357,7 +354,7 @@ mod tests {
         assert!(s[1].archived);
         assert!(s[2].empty && s[2].default_branch.is_none());
         assert!(s.iter().all(|s| s.topics.is_none()));
-        assert_eq!(p.repos[0].locator, "p-fleet/r1");
+        assert_eq!(p.repos[0].snapshot.locator, "p-fleet/r1");
         assert_eq!(
             t.seen(),
             vec!["GET /org/_apis/git/repositories?api-version=7.1"]

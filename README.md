@@ -2,8 +2,9 @@
 
 **An accurate inventory of your repository fleet, across Forgejo, GitHub, GitLab and Azure DevOps.**
 
-Repoplane connects to an organisation on a forge and keeps a record of every repository in it:
-name, default branch, topics, archived state, and the HEAD commit of every default branch. It
+Repoplane connects to an organisation on a forge and keeps a record of every repository in it
+(name, default branch, topics, archived state), and reads the HEAD commit of the default
+branches you ask about. It
 is the ground the rest of repoplane stands on: rules evaluated at an exact revision, and fleet
 changes verified by re-evaluation rather than by counting merged pull requests.
 
@@ -19,6 +20,15 @@ Discovered     6
 Recorded       6
 Inaccessible   0
 
+$ repoplane repo refresh-heads --connection lab --topic node --wait
+Refresh     hrf_06G9N0A2QPZ3M4X5Y6T7V8W9RS
+Connection  lab
+Status      succeeded
+
+Targeted       3
+Observed       3
+Changed        3
+
 $ repoplane repo list --topic node --archived false
 REPOSITORY                    BRANCH   ARCHIVED   HEAD       TOPICS
 acme-services/billing-api     main     false      22d00302   node service sonar
@@ -26,9 +36,17 @@ acme-services/ledger-worker   main     false      1833865b   node service
 acme-services/node-gateway    main     false      568a26e9   gateway node service
 ```
 
-*Discovered* is what the forge listed. *Recorded* is what changed in the inventory, so a second
-run with nothing changed records 0. *Inaccessible* is what a complete listing no longer shows;
-those repositories are marked, never deleted.
+Two operations, each doing one thing:
+
+- **`connection reconcile`** records *what exists*. *Discovered* is what the forge listed.
+  *Recorded* is what changed in the inventory, so a second run with nothing changed records 0.
+  *Inaccessible* is what a complete listing no longer shows (after a direct lookup confirms it
+  gone); those repositories are marked, never deleted. It reads no HEAD, so it costs one to three
+  requests per organisation on GitHub, GitLab and Azure DevOps.
+- **`repo refresh-heads`** reads *what each repository's default branch points at*, for a
+  connection's repositories or only those a filter selects. A scan of the `node` repositories
+  reads their HEADs, not the organisation's. *Changed* counts HEADs that moved. `repo list`
+  shows the last HEAD observed, or `—` until one has been.
 
 ## How it is built
 

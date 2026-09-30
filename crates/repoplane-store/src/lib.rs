@@ -1,11 +1,12 @@
 //! Postgres: the product state (connections, repositories, reconcile runs) and the task queue
 //! workers lease from. Only the API links this crate; a worker never opens a database (ADR 0001).
 
+mod heads;
 mod queue;
 mod repos;
 
 use chrono::{DateTime, Utc};
-use repoplane_proto::api::{AuthMode, Connection, CreateConnection, Reconcile, ReconcileStatus};
+use repoplane_proto::api::{AuthMode, Connection, CreateConnection, Reconcile, RunStatus};
 use repoplane_proto::id::{ConnectionId, OrgId, ReconcileId, TaskId};
 use repoplane_proto::{ForgeKind, secret};
 use sqlx::postgres::{PgPool, PgPoolOptions};
@@ -383,12 +384,12 @@ impl ReconcileRow {
     }
 }
 
-fn parse_status(s: &str) -> Result<ReconcileStatus> {
+pub(crate) fn parse_status(s: &str) -> Result<RunStatus> {
     Ok(match s {
-        "queued" => ReconcileStatus::Queued,
-        "running" => ReconcileStatus::Running,
-        "succeeded" => ReconcileStatus::Succeeded,
-        "failed" => ReconcileStatus::Failed,
+        "queued" => RunStatus::Queued,
+        "running" => RunStatus::Running,
+        "succeeded" => RunStatus::Succeeded,
+        "failed" => RunStatus::Failed,
         other => {
             return Err(StoreError::Invalid(format!(
                 "unknown reconcile status {other:?}"

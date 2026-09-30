@@ -36,6 +36,7 @@ struct RepoRow {
     archived: bool,
     topics: Option<Vec<String>>,
     head_sha: Option<String>,
+    head_observed_at: Option<DateTime<Utc>>,
     empty: bool,
     web_url: Option<String>,
     status: String,
@@ -55,7 +56,7 @@ impl Store {
         };
         let rows: Vec<RepoRow> = sqlx::query_as(
             "select id, connection_id, external_id, full_name, name, default_branch, archived,
-                    topics, head_sha, empty, web_url, status, first_seen_at, last_seen_at
+                    topics, head_sha, head_observed_at, empty, web_url, status, first_seen_at, last_seen_at
              from repositories
              where organization_id = $1
                and ($2::uuid is null or connection_id = $2)
@@ -102,6 +103,7 @@ impl RepoRow {
             archived: self.archived,
             topics: self.topics,
             head: self.head_sha,
+            head_observed_at: self.head_observed_at,
             empty: self.empty,
             web_url: self.web_url,
             status: match self.status.as_str() {

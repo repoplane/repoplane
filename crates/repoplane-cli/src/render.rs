@@ -1,7 +1,7 @@
 //! What the CLI prints. Tables are padded to their widest cell plus three spaces; absent values
 //! print as `—`, which is never confused with an empty string or a zero.
 
-use repoplane_proto::api::{Connection, Reconcile, Repository};
+use repoplane_proto::api::{Connection, HeadRefresh, Reconcile, Repository};
 
 const ABSENT: &str = "—";
 
@@ -159,11 +159,46 @@ pub fn reconcile(r: &Reconcile) -> String {
     out
 }
 
+/// ```text
+/// Refresh     hrf_06G9N0A2QPZ3M4X5Y6T7V8W9RS
+/// Connection  lab
+/// Status      succeeded
+///
+/// Targeted      17
+/// Observed      17
+/// Changed        3
+/// ```
+pub fn head_refresh(connection: &str, r: &HeadRefresh) -> String {
+    let mut out = format!(
+        "{:<12}{}\n{:<12}{connection}\n{:<12}{}\n",
+        "Refresh",
+        r.id,
+        "Connection",
+        "Status",
+        r.status.as_str()
+    );
+    if let Some(e) = &r.error {
+        out.push_str(&format!("{:<12}{e}\n", "Error"));
+    }
+    let n = [r.targeted, r.observed, r.changed];
+    let w = n
+        .iter()
+        .map(|v| v.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max(3);
+    out.push('\n');
+    for (k, v) in [("Targeted", n[0]), ("Observed", n[1]), ("Changed", n[2])] {
+        out.push_str(&format!("{k:<13}{v:>w$}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use repoplane_proto::api::{ReconcileStatus, RepositoryStatus};
+    use repoplane_proto::api::{RepositoryStatus, RunStatus};
     use repoplane_proto::id::{ConnectionId, ReconcileId, RepositoryId};
 
     fn repo(name: &str, head: &str, topics: &[&str]) -> Repository {
@@ -177,6 +212,7 @@ mod tests {
             archived: false,
             topics: Some(topics.iter().map(|s| s.to_string()).collect()),
             head: Some(head.into()),
+            head_observed_at: None,
             empty: false,
             web_url: None,
             status: RepositoryStatus::Active,
@@ -220,7 +256,7 @@ mod tests {
                 .parse::<ReconcileId>()
                 .unwrap(),
             connection_id: ConnectionId::new(),
-            status: ReconcileStatus::Succeeded,
+            status: RunStatus::Succeeded,
             discovered: 6,
             recorded: 6,
             inaccessible: 0,

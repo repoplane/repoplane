@@ -27,13 +27,11 @@ pub use error::{Class, ForgeError};
 pub use http::{ReqwestTransport, ScriptedTransport, Transport};
 pub use token::Token;
 
-/// One repository as a listing found it, before its HEAD is read.
+/// One repository as a listing found it. Its `locator` is what `heads` needs to find it again:
+/// an API path, a project id, opaque outside the adapter that made it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Listed {
     pub snapshot: RepoSnapshot,
-    /// What `heads` needs to find this repository again: an API path, a project id. Opaque
-    /// outside the adapter that made it.
-    pub locator: String,
 }
 
 /// A page of a listing, and where the next one starts.

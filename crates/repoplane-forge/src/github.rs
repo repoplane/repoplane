@@ -140,11 +140,10 @@ impl Repo {
                 default_branch: self.default_branch.filter(|b| !b.is_empty()),
                 archived: self.archived,
                 topics: Some(self.topics.unwrap_or_default()),
-                head: None,
+                locator,
                 empty,
                 web_url: self.html_url,
             },
-            locator,
         }
     }
 }
@@ -262,10 +261,9 @@ impl Github {
         let mut fields = String::new();
         let mut vars = serde_json::Map::new();
         for (i, r) in repos.iter().enumerate() {
-            let (owner, name) = r
-                .locator
-                .split_once('/')
-                .ok_or_else(|| ForgeError::protocol(FORGE, format!("full name {:?}", r.locator)))?;
+            let (owner, name) = r.snapshot.locator.split_once('/').ok_or_else(|| {
+                ForgeError::protocol(FORGE, format!("full name {:?}", r.snapshot.locator))
+            })?;
             params.push(format!("$o{i}: String!, $n{i}: String!"));
             fields.push_str(&format!(
                 " r{i}: repository(owner: $o{i}, name: $n{i}) {{ defaultBranchRef {{ target {{ oid }} }} }}"
@@ -468,11 +466,10 @@ mod tests {
                     default_branch: Some("main".into()),
                     archived: false,
                     topics: Some(vec![]),
-                    head: None,
+                    locator: format!("acme/{n}"),
                     empty: false,
                     web_url: None,
                 },
-                locator: format!("acme/{n}"),
             })
             .collect()
     }

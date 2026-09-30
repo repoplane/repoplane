@@ -78,11 +78,10 @@ impl Repo {
                 default_branch: self.default_branch.filter(|b| !b.is_empty()),
                 archived: self.archived,
                 topics: Some(self.topics.unwrap_or_default()),
-                head: None,
+                locator: owner_repo,
                 empty: self.empty,
                 web_url: self.html_url,
             },
-            locator: owner_repo,
         }
     }
 }
@@ -183,10 +182,9 @@ impl Forgejo {
         let Some(branch) = s.default_branch.as_deref().filter(|_| !s.empty) else {
             return Ok(None);
         };
-        let (owner, name) = r
-            .locator
-            .split_once('/')
-            .ok_or_else(|| ForgeError::protocol(FORGE, format!("full name {:?}", r.locator)))?;
+        let (owner, name) = r.snapshot.locator.split_once('/').ok_or_else(|| {
+            ForgeError::protocol(FORGE, format!("full name {:?}", r.snapshot.locator))
+        })?;
         let url = format!(
             "{}/repos/{}/{}/branches/{}",
             self.api,
@@ -333,11 +331,10 @@ mod tests {
                     default_branch: Some("main".into()),
                     archived: false,
                     topics: Some(vec![]),
-                    head: None,
+                    locator: format!("acme/{n}"),
                     empty: *n == "b",
                     web_url: None,
                 },
-                locator: format!("acme/{n}"),
             })
             .collect();
         let heads = f.heads(&listed).await.unwrap();

@@ -11,12 +11,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use repoplane_proto::api::{
-    ConnectionList, CreateConnection, ErrorBody, Reconcile, RepositoryList,
+    ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
+    RepositoryList,
 };
-use repoplane_proto::id::{ReconcileId, TaskId};
+use repoplane_proto::id::{HeadRefreshId, ReconcileId, TaskId};
 use repoplane_proto::worker::{
-    Complete, Fail, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload, Unseen, UnseenRepo,
-    UnseenRequest,
+    Complete, Fail, HeadsAck, HeadsUpload, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload,
+    Unseen, UnseenRepo, UnseenRequest,
 };
 use repoplane_store::{RepoFilter, Store, StoreError};
 use serde::Deserialize;
@@ -44,12 +45,18 @@ pub fn router(state: AppState) -> Router {
         .route("/connections/{key}", get(get_connection))
         .route("/connections/{key}/reconciles", post(request_reconcile))
         .route("/reconciles/{id}", get(get_reconcile))
+        .route(
+            "/connections/{key}/head-refreshes",
+            post(request_head_refresh),
+        )
+        .route("/head-refreshes/{id}", get(get_head_refresh))
         .route("/repositories", get(list_repositories));
     let worker = Router::new()
         .route("/lease", post(lease))
         .route("/tasks/{id}/heartbeat", post(heartbeat))
         .route("/tasks/{id}/pages", post(upload_page))
         .route("/tasks/{id}/unseen", post(unseen))
+        .route("/tasks/{id}/heads", post(upload_heads))
         .route("/tasks/{id}/complete", post(complete))
         .route("/tasks/{id}/fail", post(fail));
     Router::new()
@@ -278,6 +285,45 @@ async fn get_reconcile(
     }
 }
 
+/// Reads the HEADs of a connection's repositories, all of them or those matching the body's
+/// filter. Separate from a reconcile, which records what exists and reads no HEAD.
+async fn request_head_refresh(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(key): Path<String>,
+    body: Option<Json<RefreshHeads>>,
+) -> ApiResult<impl IntoResponse> {
+    admin(&s, &h)?;
+    let c = s.store.connection(&key).await?;
+    let filter = body.map(|Json(b)| b).unwrap_or_default();
+    let r = s.store.request_head_refresh(&c, &filter).await?;
+    Ok((StatusCode::CREATED, Json(r)))
+}
+
+async fn get_head_refresh(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<WaitQuery>,
+) -> ApiResult<Json<HeadRefresh>> {
+    admin(&s, &h)?;
+    let id: HeadRefreshId = id
+        .parse()
+        .map_err(|e: repoplane_proto::id::IdError| ApiError::bad(e.to_string()))?;
+    let wait = match q.wait.as_deref() {
+        Some(w) => parse_wait(w)?.min(MAX_RECONCILE_WAIT),
+        None => Duration::ZERO,
+    };
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let r = s.store.head_refresh(id).await?;
+        if r.status.is_terminal() || tokio::time::Instant::now() + POLL > deadline {
+            return Ok(Json(r));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 #[derive(Deserialize)]
 struct RepoQuery {
     connection: Option<String>,
@@ -392,6 +438,20 @@ async fn upload_page(
     Ok(Json(PageAck {
         recorded: out.recorded,
     }))
+}
+
+async fn upload_heads(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<HeadsUpload>,
+) -> ApiResult<Json<HeadsAck>> {
+    worker_queue(&s, &h)?;
+    let changed = s
+        .store
+        .upload_heads(task_id(&id)?, b.lease_id, LEASE_TTL_SECS, &b.heads)
+        .await?;
+    Ok(Json(HeadsAck { changed }))
 }
 
 async fn unseen(

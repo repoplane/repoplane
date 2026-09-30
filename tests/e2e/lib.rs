@@ -17,7 +17,7 @@ use forgelab::fleet::read_lock;
 use forgelab::forge::GitRemote;
 use forgelab::sandbox::{CommandError, Env, Options, load_config};
 use repoplane_proto::ForgeKind;
-use repoplane_proto::api::{Reconcile, Repository};
+use repoplane_proto::api::{HeadRefresh, Reconcile, Repository};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use testcontainers::core::wait::HttpWaitStrategy;
@@ -308,6 +308,17 @@ impl ForgeSide {
         fleet_path: &str,
         branch: &str,
     ) -> anyhow::Result<String> {
+        self.push_commit_to(fleet, fleet_path, branch, branch).await
+    }
+
+    /// Pushes one new commit, made on top of `from`, to the branch `to` (created if need be).
+    pub async fn push_commit_to(
+        &self,
+        fleet: &str,
+        fleet_path: &str,
+        from: &str,
+        to: &str,
+    ) -> anyhow::Result<String> {
         let env = self.env(fleet)?;
         let remote = env
             .forge
@@ -323,7 +334,7 @@ impl ForgeSide {
                 "--depth",
                 "1",
                 "--branch",
-                branch,
+                from,
                 remote.url.as_str(),
                 "w",
             ],
@@ -355,7 +366,7 @@ impl ForgeSide {
         git(
             &remote,
             &work,
-            &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")],
+            &["push", "-q", "origin", &format!("HEAD:refs/heads/{to}")],
         )
         .await?;
         let sha = git(&remote, &work, &["rev-parse", "HEAD"]).await?;
@@ -603,6 +614,34 @@ impl Stack {
             "20m",
         ])
         .await
+    }
+
+    /// Reads HEADs of a connection's repositories (all, or those `filter` selects) and waits.
+    pub async fn refresh_heads(
+        &self,
+        connection: &str,
+        filter: &[&str],
+    ) -> anyhow::Result<HeadRefresh> {
+        let mut args = vec![
+            "repo",
+            "refresh-heads",
+            "--connection",
+            connection,
+            "--wait",
+            "--timeout",
+            "20m",
+        ];
+        args.extend(filter);
+        let mut runs: Vec<HeadRefresh> = self.cli_json(&args).await?;
+        anyhow::ensure!(runs.len() == 1, "want one refresh, got {}", runs.len());
+        let r = runs.remove(0);
+        anyhow::ensure!(
+            r.status.as_str() == "succeeded",
+            "head refresh {}: {:?}",
+            r.status.as_str(),
+            r.error
+        );
+        Ok(r)
     }
 
     pub async fn repos(

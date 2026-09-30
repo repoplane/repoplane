@@ -105,12 +105,11 @@ impl Project {
                 default_branch: self.default_branch.filter(|b| !b.is_empty()),
                 archived: self.archived,
                 topics: Some(self.topics.unwrap_or_default()),
-                head: None,
+                // The numeric id survives renames and transfers, and needs no escaping.
+                locator: self.id.to_string(),
                 empty: self.empty_repo,
                 web_url: self.web_url,
             },
-            // The numeric id survives renames and transfers, and needs no escaping.
-            locator: self.id.to_string(),
         }
     }
 
@@ -249,7 +248,7 @@ impl Gitlab {
         let url = format!(
             "{}/projects/{}/repository/branches/{}",
             self.api,
-            escape_segment(&r.locator),
+            escape_segment(&r.snapshot.locator),
             escape_segment(branch)
         );
         match self.http.get_json::<Branch>(&url).await {
@@ -299,11 +298,10 @@ mod tests {
                 default_branch: branch.map(String::from),
                 archived: false,
                 topics: Some(vec![]),
-                head: None,
+                locator: id.into(),
                 empty,
                 web_url: None,
             },
-            locator: id.into(),
         }
     }
 
@@ -352,7 +350,7 @@ mod tests {
             (db.snapshot.name.as_str(), db.snapshot.external_id.as_str()),
             ("db", "2")
         );
-        assert_eq!(db.locator, "2");
+        assert_eq!(db.snapshot.locator, "2");
         let p2 = g.page(p1.next.as_deref()).await.unwrap();
         assert!(p2.next.is_none());
         let old = &p2.repos[0].snapshot;

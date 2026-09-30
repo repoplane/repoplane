@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use repoplane_proto::api::{
-    Connection, ConnectionList, CreateConnection, ErrorBody, Reconcile, RepositoryList,
+    Connection, ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
+    RepositoryList,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -74,6 +75,35 @@ impl Client {
         wait: Option<Duration>,
     ) -> anyhow::Result<Reconcile> {
         let mut req = self.http.get(self.url(&format!("/reconciles/{}", seg(id))));
+        if let Some(w) = wait {
+            req = req
+                .query(&[("wait", format!("{}s", w.as_secs()))])
+                .timeout(w + Duration::from_secs(15));
+        }
+        self.send(req).await
+    }
+
+    pub async fn refresh_heads(
+        &self,
+        key: &str,
+        filter: &RefreshHeads,
+    ) -> anyhow::Result<HeadRefresh> {
+        self.send(
+            self.http
+                .post(self.url(&format!("/connections/{}/head-refreshes", seg(key))))
+                .json(filter),
+        )
+        .await
+    }
+
+    pub async fn head_refresh_status(
+        &self,
+        id: &str,
+        wait: Option<Duration>,
+    ) -> anyhow::Result<HeadRefresh> {
+        let mut req = self
+            .http
+            .get(self.url(&format!("/head-refreshes/{}", seg(id))));
         if let Some(w) = wait {
             req = req
                 .query(&[("wait", format!("{}s", w.as_secs()))])

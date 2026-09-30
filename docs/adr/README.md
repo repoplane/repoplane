@@ -10,3 +10,4 @@
 - [8. Worker ↔ API is HTTPS long-poll task queues, not Temporal](0008-http-task-queues.md): New
 - [9. Forge differences are modelled, not hidden](0009-forge-differences-are-modelled.md): New
 - [10. Webhooks are the fast path; reconciliation is the correctness path](0010-webhooks-fast-path-reconcile-correctness.md): New
+- [11. Inventory and HEADs are separate operations](0011-inventory-and-heads-are-separate.md): New

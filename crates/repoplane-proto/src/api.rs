@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::forge::ForgeKind;
-use crate::id::{ConnectionId, ReconcileId, RepositoryId};
+use crate::id::{ConnectionId, HeadRefreshId, ReconcileId, RepositoryId};
 
 /// How a connection authenticates to its forge. Day 0 knows one way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,24 +53,24 @@ pub struct ConnectionList {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ReconcileStatus {
+pub enum RunStatus {
     Queued,
     Running,
     Succeeded,
     Failed,
 }
 
-impl ReconcileStatus {
+impl RunStatus {
     pub fn is_terminal(self) -> bool {
-        matches!(self, ReconcileStatus::Succeeded | ReconcileStatus::Failed)
+        matches!(self, RunStatus::Succeeded | RunStatus::Failed)
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            ReconcileStatus::Queued => "queued",
-            ReconcileStatus::Running => "running",
-            ReconcileStatus::Succeeded => "succeeded",
-            ReconcileStatus::Failed => "failed",
+            RunStatus::Queued => "queued",
+            RunStatus::Running => "running",
+            RunStatus::Succeeded => "succeeded",
+            RunStatus::Failed => "failed",
         }
     }
 }
@@ -79,7 +79,7 @@ impl ReconcileStatus {
 pub struct Reconcile {
     pub id: ReconcileId,
     pub connection_id: ConnectionId,
-    pub status: ReconcileStatus,
+    pub status: RunStatus,
     /// Repositories the forge listed.
     pub discovered: i64,
     /// Repositories written to the inventory: new, or changed since the last run.
@@ -115,9 +115,12 @@ pub struct Repository {
     /// `None` when the forge has no topics (Azure DevOps), which is not the same as a
     /// repository with none.
     pub topics: Option<Vec<String>>,
-    /// The default branch's HEAD commit. `None` for an empty repository, or one whose HEAD the
-    /// forge refused to tell (a disabled Azure DevOps repository).
+    /// The default-branch HEAD commit as last observed by a head refresh; `None` until one has,
+    /// and for an empty repository or one whose HEAD the forge will not tell (a disabled Azure
+    /// DevOps repository). A reconcile does not read it, and clears it when the default branch
+    /// changes, since it described another branch.
     pub head: Option<String>,
+    pub head_observed_at: Option<DateTime<Utc>>,
     pub empty: bool,
     pub web_url: Option<String>,
     pub status: RepositoryStatus,
@@ -130,6 +133,32 @@ pub struct RepositoryList {
     pub items: Vec<Repository>,
     /// Pass back as `cursor` for the next page; absent on the last one.
     pub next_cursor: Option<String>,
+}
+
+/// Which repositories of a connection a head refresh reads. Empty means all of them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RefreshHeads {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeadRefresh {
+    pub id: HeadRefreshId,
+    pub connection_id: ConnectionId,
+    pub status: RunStatus,
+    /// Repositories the refresh was asked to read.
+    pub targeted: i64,
+    /// Repositories whose HEAD the forge answered for (a `None` is an answer).
+    pub observed: i64,
+    /// Repositories whose HEAD differs from the one recorded before.
+    pub changed: i64,
+    pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 /// An error answer, on every endpoint.

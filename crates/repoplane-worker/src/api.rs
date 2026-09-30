@@ -6,7 +6,8 @@ use anyhow::Context;
 use repoplane_proto::api::ErrorBody;
 use repoplane_proto::id::TaskId;
 use repoplane_proto::worker::{
-    Complete, Fail, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload, Unseen, UnseenRequest,
+    Complete, Fail, HeadsAck, HeadsUpload, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload,
+    Unseen, UnseenRequest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -77,6 +78,19 @@ impl Api {
             .send()
             .await
             .context("upload page")?;
+        read(resp).await
+    }
+
+    pub async fn upload_heads(&self, task: TaskId, body: &HeadsUpload) -> anyhow::Result<HeadsAck> {
+        let resp = self
+            .http
+            .post(format!("{}/tasks/{task}/heads", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(60))
+            .json(body)
+            .send()
+            .await
+            .context("upload heads")?;
         read(resp).await
     }
 

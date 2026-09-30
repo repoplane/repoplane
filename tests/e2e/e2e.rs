@@ -68,6 +68,11 @@ async fn inventory() {
         ),
         ("direct lookup by id", false, Box::pin(direct_lookup(&s))),
         (
+            "head refresh reads only its targets",
+            false,
+            Box::pin(refresh_targets(&s)),
+        ),
+        (
             "a repository skipped by a shifting listing stays active",
             true,
             Box::pin(shifting_listing(&s)),
@@ -75,6 +80,11 @@ async fn inventory() {
         ("topic changed", true, Box::pin(topic_changed(&s))),
         ("commit pushed", true, Box::pin(commit_pushed(&s))),
         ("archived", true, Box::pin(archived(&s))),
+        (
+            "a new default branch clears the recorded HEAD",
+            true,
+            Box::pin(default_branch_changed(&s)),
+        ),
         (
             "deleted repo goes inaccessible",
             true,
@@ -121,6 +131,18 @@ async fn baseline(s: &Suite) -> anyhow::Result<()> {
         r.status.as_str(),
         r.error
     );
+    // A reconcile records what exists and reads no HEAD.
+    let listed = s.stack.repos(&s.connection, false).await?;
+    let with_head = listed.iter().filter(|r| r.head.is_some()).count();
+    anyhow::ensure!(with_head == 0, "a reconcile recorded {with_head} HEAD(s)");
+    let h = s.stack.refresh_heads(&s.connection, &[]).await?;
+    anyhow::ensure!(
+        h.targeted == listed.len() as i64 && h.observed == h.targeted,
+        "head refresh targeted {} and observed {} of {} repositories",
+        h.targeted,
+        h.observed,
+        listed.len()
+    );
     let want = expected(&s.side)?;
     let repos = s.stack.repos(&s.connection, false).await?;
     let (diffs, extras) = compare(&want, &repos);
@@ -156,6 +178,7 @@ async fn resync(s: &Suite) -> anyhow::Result<()> {
         r.status.as_str(),
         r.error
     );
+    s.stack.refresh_heads(&s.connection, &[]).await?;
     let (diffs, _) = compare(
         &expected(&s.side)?,
         &s.stack.repos(&s.connection, false).await?,
@@ -172,6 +195,50 @@ async fn idempotent(s: &Suite) -> anyhow::Result<()> {
         "recorded {}, inaccessible {}",
         r.recorded,
         r.inaccessible
+    );
+    let h = s.stack.refresh_heads(&s.connection, &[]).await?;
+    anyhow::ensure!(
+        h.changed == 0,
+        "a second head refresh changed {}",
+        h.changed
+    );
+    Ok(())
+}
+
+/// A head refresh reads only what its filter selects: a scan of the `node` repositories must
+/// not pay for the rest of the organisation.
+async fn refresh_targets(s: &Suite) -> anyhow::Result<()> {
+    if !s.side.forge.caps().topics {
+        let err = s
+            .stack
+            .refresh_heads(&s.connection, &["--topic", "node"])
+            .await
+            .expect_err("a topic filter on a forge without topics must be refused");
+        anyhow::ensure!(err.to_string().contains("no repository topics"), "{err}");
+        return Ok(());
+    }
+    let node = s
+        .stack
+        .cli_json::<Vec<repoplane_proto::api::Repository>>(&[
+            "repo",
+            "list",
+            "--connection",
+            &s.connection,
+            "--topic",
+            "node",
+        ])
+        .await?
+        .len() as i64;
+    let h = s
+        .stack
+        .refresh_heads(&s.connection, &["--topic", "node"])
+        .await?;
+    anyhow::ensure!(
+        node > 0 && h.targeted == node && h.observed == node && h.changed == 0,
+        "targeted {}, observed {}, changed {}; {node} repositories carry the topic",
+        h.targeted,
+        h.observed,
+        h.changed
     );
     Ok(())
 }
@@ -412,14 +479,61 @@ async fn topic_changed(s: &Suite) -> anyhow::Result<()> {
 /// A commit pushed to a default branch moves that repository's HEAD, and only that one.
 async fn commit_pushed(s: &Suite) -> anyhow::Result<()> {
     let sha = s.side.push_commit("shapes", "compliant", "main").await?;
+    // A push changes what a repository holds, not whether it exists: the inventory stays put,
+    // and the head refresh sees the move.
     let r = s.stack.reconcile(&s.connection).await?;
-    anyhow::ensure!(r.recorded == 1, "recorded {}, want 1", r.recorded);
+    anyhow::ensure!(r.recorded == 0, "reconcile recorded {}, want 0", r.recorded);
+    let h = s.stack.refresh_heads(&s.connection, &[]).await?;
+    anyhow::ensure!(h.changed == 1, "head refresh changed {}, want 1", h.changed);
     let repos = s.stack.repos(&s.connection, false).await?;
     let name = s.side.full_name("compliant");
     let c = repos
         .iter()
         .find(|r| r.full_name == name)
         .ok_or_else(|| anyhow::anyhow!("{name} missing"))?;
+    anyhow::ensure!(
+        c.head.as_deref() == Some(sha.as_str()),
+        "head {:?}, want {sha}",
+        c.head
+    );
+    Ok(())
+}
+
+/// A HEAD describes a branch. When the default branch changes, the recorded HEAD described the
+/// old one: the next reconcile clears it, and the next head refresh reads the new branch's.
+async fn default_branch_changed(s: &Suite) -> anyhow::Result<()> {
+    let sha = s
+        .side
+        .push_commit_to("shapes", "compliant", "main", "e2e-default")
+        .await?;
+    let env = s.side.env("shapes")?;
+    env.forge
+        .update_settings(
+            "compliant",
+            Settings {
+                default_branch: Some("e2e-default".into()),
+                ..Settings::default()
+            },
+        )
+        .await?;
+    let name = s.side.full_name("compliant");
+    let find = |repos: Vec<repoplane_proto::api::Repository>| {
+        repos
+            .into_iter()
+            .find(|r| r.full_name == name)
+            .ok_or_else(|| anyhow::anyhow!("{name} missing"))
+    };
+    let r = s.stack.reconcile(&s.connection).await?;
+    anyhow::ensure!(r.recorded == 1, "recorded {}, want 1", r.recorded);
+    let c = find(s.stack.repos(&s.connection, false).await?)?;
+    anyhow::ensure!(
+        c.default_branch.as_deref() == Some("e2e-default") && c.head.is_none(),
+        "after the reconcile: branch {:?}, head {:?}; want e2e-default and no HEAD",
+        c.default_branch,
+        c.head
+    );
+    s.stack.refresh_heads(&s.connection, &[]).await?;
+    let c = find(s.stack.repos(&s.connection, false).await?)?;
     anyhow::ensure!(
         c.head.as_deref() == Some(sha.as_str()),
         "head {:?}, want {sha}",
@@ -442,6 +556,7 @@ async fn archived(s: &Suite) -> anyhow::Result<()> {
         .await?;
     let r = s.stack.reconcile(&s.connection).await?;
     anyhow::ensure!(r.recorded == 1, "recorded {}, want 1", r.recorded);
+    s.stack.refresh_heads(&s.connection, &[]).await?;
     let repos = s.stack.repos(&s.connection, false).await?;
     let name = s.side.full_name("scaffold");
     let a = repos

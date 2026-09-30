@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use repoplane_proto::api::{AuthMode, CreateConnection, ReconcileStatus};
+use repoplane_proto::api::{AuthMode, CreateConnection, RefreshHeads, RunStatus};
 use repoplane_proto::{ForgeKind, secret};
 
 use crate::client::{Client, RepoQuery};
@@ -115,6 +115,21 @@ enum RepoCmd {
         /// Include repositories absent from the latest complete listing.
         #[arg(long)]
         include_inaccessible: bool,
+    },
+    /// Read the default-branch HEAD of repositories: a connection's, or every connection's.
+    /// A reconcile records what exists; this reads what each repository's HEAD is now.
+    RefreshHeads {
+        #[arg(long)]
+        connection: Option<String>,
+        #[arg(long)]
+        topic: Option<String>,
+        #[arg(long)]
+        archived: Option<bool>,
+        /// Wait for every refresh to finish, and exit non-zero if one fails.
+        #[arg(long)]
+        wait: bool,
+        #[arg(long, default_value = "30m", value_parser = parse_duration)]
+        timeout: Duration,
     },
 }
 
@@ -225,6 +240,52 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             print(out, render::reconcile(&r), &r)?;
             return Ok(exit_for(r.status, wait));
         }
+        Command::Repo(RepoCmd::RefreshHeads {
+            connection,
+            topic,
+            archived,
+            wait,
+            timeout,
+        }) => {
+            let connections = match connection {
+                Some(c) => vec![api.connection(&c).await?],
+                None => api.connections().await?.items,
+            };
+            let filter = RefreshHeads { topic, archived };
+            let mut runs = Vec::new();
+            for c in &connections {
+                if filter.topic.is_some() && !c.forge.caps().topics && connections.len() > 1 {
+                    eprintln!(
+                        "repoplane: skipping {}: {} has no repository topics",
+                        c.name, c.forge
+                    );
+                    continue;
+                }
+                runs.push((
+                    c.name.clone(),
+                    api.refresh_heads(&c.id.to_string(), &filter).await?,
+                ));
+            }
+            let mut status = ReconcileOrRefresh::default();
+            let mut out_table = String::new();
+            let mut out_json = Vec::new();
+            for (name, r) in runs {
+                let id = r.id.to_string();
+                let r = if wait {
+                    wait_until(timeout, |w| api.head_refresh_status(&id, w), |r| r.status).await?
+                } else {
+                    r
+                };
+                status.see(r.status, wait);
+                if !out_table.is_empty() {
+                    out_table.push('\n');
+                }
+                out_table.push_str(&render::head_refresh(&name, &r));
+                out_json.push(r);
+            }
+            print(out, out_table, &out_json)?;
+            return Ok(status.exit());
+        }
         Command::Repo(RepoCmd::List {
             connection,
             topic,
@@ -253,9 +314,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn exit_for(status: ReconcileStatus, waited: bool) -> ExitCode {
+fn exit_for(status: RunStatus, waited: bool) -> ExitCode {
     match status {
-        ReconcileStatus::Failed => ExitCode::FAILURE,
+        RunStatus::Failed => ExitCode::FAILURE,
         s if waited && !s.is_terminal() => ExitCode::from(3),
         _ => ExitCode::SUCCESS,
     }
@@ -267,27 +328,62 @@ async fn wait_for(
     id: &str,
     timeout: Duration,
 ) -> anyhow::Result<repoplane_proto::api::Reconcile> {
+    wait_until(timeout, |w| api.reconcile_status(id, w), |r| r.status).await
+}
+
+/// Asks with a long wait, again and again, until the run's status is terminal or `timeout`
+/// has passed.
+async fn wait_until<T, F, Fut>(
+    timeout: Duration,
+    ask: F,
+    status: impl Fn(&T) -> RunStatus,
+) -> anyhow::Result<T>
+where
+    F: Fn(Option<Duration>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
     let deadline = Instant::now() + timeout;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        let r = api
-            .reconcile_status(
-                id,
-                Some(
-                    left.min(Duration::from_secs(30))
-                        .max(Duration::from_secs(1)),
-                ),
-            )
-            .await?;
-        if r.status.is_terminal() || Instant::now() >= deadline {
-            if !r.status.is_terminal() {
+        let r = ask(Some(
+            left.min(Duration::from_secs(30))
+                .max(Duration::from_secs(1)),
+        ))
+        .await?;
+        let st = status(&r);
+        if st.is_terminal() || Instant::now() >= deadline {
+            if !st.is_terminal() {
                 eprintln!(
                     "repoplane: still {} after {}s",
-                    r.status.as_str(),
+                    st.as_str(),
                     timeout.as_secs()
                 );
             }
             return Ok(r);
+        }
+    }
+}
+
+/// The exit code of several runs: failure if any failed, 3 if any is still going.
+#[derive(Default)]
+struct ReconcileOrRefresh {
+    failed: bool,
+    unfinished: bool,
+}
+
+impl ReconcileOrRefresh {
+    fn see(&mut self, s: RunStatus, waited: bool) {
+        self.failed |= s == RunStatus::Failed;
+        self.unfinished |= waited && !s.is_terminal();
+    }
+
+    fn exit(&self) -> ExitCode {
+        if self.failed {
+            ExitCode::FAILURE
+        } else if self.unfinished {
+            ExitCode::from(3)
+        } else {
+            ExitCode::SUCCESS
         }
     }
 }
@@ -338,5 +434,16 @@ mod tests {
         ])
         .unwrap();
         Cli::try_parse_from(["repoplane", "connection", "reconcile", "lab", "--wait"]).unwrap();
+        Cli::try_parse_from([
+            "repoplane",
+            "repo",
+            "refresh-heads",
+            "--connection",
+            "lab",
+            "--topic",
+            "node",
+            "--wait",
+        ])
+        .unwrap();
     }
 }

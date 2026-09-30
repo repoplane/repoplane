@@ -3,7 +3,11 @@
 //! database or accepts a connection (ADR 0001, 0003, 0008).
 
 mod api;
+#[cfg(test)]
+mod fake;
+mod heads;
 mod reconcile;
+mod task;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -131,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(Some(lease)) => {
                 backoff = Duration::from_millis(500);
                 let (api, transport, cancel) = (api.clone(), transport.clone(), cancel.clone());
-                running.spawn(async move { reconcile::run(api, transport, lease, cancel).await });
+                running.spawn(async move { task::run(api, transport, lease, cancel).await });
             }
             Ok(None) => {}
             Err(e) => {

@@ -78,8 +78,8 @@ networks put in the way ([ADR 0008](adr/0008-http-task-queues.md)).
 
 | Component | Responsibility |
 |---|---|
-| `http` public (`/v1`) | connections, reconciles (with `?wait=` long-poll), repositories (filtered, keyset-paged). Admin bearer token. |
-| `http` worker (`/v1/worker`) | lease, heartbeat, page upload, unseen, complete, fail. One bearer token per queue; every call after the lease names the lease id. |
+| `http` public (`/v1`) | connections, reconciles and head refreshes (each with `?wait=` long-poll), repositories (filtered, keyset-paged). Admin bearer token. |
+| `http` worker (`/v1/worker`) | lease, heartbeat, page upload, unseen, heads upload, complete, fail. One bearer token per queue; every call after the lease names the lease id. |
 | `store` queue | Postgres task queue: `FOR UPDATE SKIP LOCKED` leases with a TTL, re-lease on expiry, bounded retries. |
 | `store` inventory | upsert keyed on `(connection, forge id)`, a per-run watermark, and inaccessible marking after a complete listing only. |
 | `store` migrations | embedded; applied by `repoplane-api migrate` only; `serve` refuses a schema other than its own. |
@@ -89,7 +89,9 @@ networks put in the way ([ADR 0008](adr/0008-http-task-queues.md)).
 | Component | Responsibility |
 |---|---|
 | poller | lease loop, bounded concurrency, graceful shutdown (in-flight forge calls are cancelled, and the task goes back on the queue) |
-| reconcile | page → HEADs → upload, repeated to the last page; then every repository the run did not see is looked up by id, and those still there are uploaded; then complete. A background heartbeat keeps the lease through long rate-limit pauses |
+| reconcile | *what exists*: page → upload, repeated to the last page; then every repository the run did not see is looked up by id, and those still there are uploaded; then complete. No HEAD is read |
+| head refresh | *what each repository holds*: the default-branch HEAD of the repositories the refresh was given (a connection's, or a filter's), read and reported in batches of 100 |
+| task | what both share: the lease, a background heartbeat that keeps it through long rate-limit pauses, complete or fail |
 | `repoplane-forge` | the four `Lister` adapters and the shared HTTP layer |
 
 ### repoplane-forge
@@ -117,8 +119,13 @@ design requires the harness to be *independently wrong* from the system it tests
 | **GitLab** | `GET /groups/{path}/projects?include_subgroups=true`, 100 per page; offset, because keyset is silently ignored on this endpoint | in the payload | `archived`; projects pending deletion excluded | one `repository/branches/{b}` per project, with the branch as a single `%2F`-escaped segment |
 | **Azure DevOps** | `GET {org}/_apis/git/repositories`: every project, disabled repositories included, in one answer | **none**: `topics` is `null`, and `--topic` on such a connection is refused | `isDisabled`, whose HEAD cannot be read | one `refs?filter=heads/{b}` per repository, exact name picked |
 
-An empty repository records `head: null` (`—` in the CLI). That is a fact about the
-repository, not a failed read.
+Reconcile and head refresh are separate operations
+([ADR 0011](adr/0011-inventory-and-heads-are-separate.md)). A reconcile records what exists and
+never reads a HEAD. When it sees a repository's default branch change, it clears the recorded
+HEAD, because that HEAD described another branch. A head refresh reads the HEADs of the
+repositories it was given, and stamps each with `head_observed_at`. The HEAD column above is
+therefore the cost of a refresh, paid only for its targets. An empty repository records
+`head: null` (`—` in the CLI); that is a fact about the repository, not a failed read.
 
 ## Crates and the boundaries between them
 
