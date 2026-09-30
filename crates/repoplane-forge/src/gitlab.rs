@@ -24,7 +24,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Class, ForgeError};
 use crate::http::{HttpClient, Transport, classify_generic, header};
-use crate::{HEAD_CONCURRENCY, Listed, Lister, Page, Token, commit_id, escape_segment, link};
+use crate::{
+    HEAD_CONCURRENCY, Listed, Lister, Page, Token, commit_id, escape_segment, link, numeric_id,
+    within,
+};
 
 const FORGE: &str = "gitlab";
 const PAGE_SIZE: u32 = 100;
@@ -93,6 +96,24 @@ struct Project {
 }
 
 impl Project {
+    fn into_listed(self) -> Listed {
+        Listed {
+            snapshot: RepoSnapshot {
+                external_id: self.id.to_string(),
+                full_name: self.path_with_namespace,
+                name: self.path,
+                default_branch: self.default_branch.filter(|b| !b.is_empty()),
+                archived: self.archived,
+                topics: Some(self.topics.unwrap_or_default()),
+                head: None,
+                empty: self.empty_repo,
+                web_url: self.web_url,
+            },
+            // The numeric id survives renames and transfers, and needs no escaping.
+            locator: self.id.to_string(),
+        }
+    }
+
     /// Scheduled for deletion: already renamed `…-deletion_scheduled-…` and no longer part of
     /// the fleet, even though GitLab keeps listing it until the delay runs out.
     fn pending_deletion(&self) -> bool {
@@ -185,21 +206,7 @@ impl Lister for Gitlab {
             repos: projects
                 .into_iter()
                 .filter(|p| !p.pending_deletion())
-                .map(|p| Listed {
-                    snapshot: RepoSnapshot {
-                        external_id: p.id.to_string(),
-                        full_name: p.path_with_namespace,
-                        name: p.path,
-                        default_branch: p.default_branch.filter(|b| !b.is_empty()),
-                        archived: p.archived,
-                        topics: Some(p.topics.unwrap_or_default()),
-                        head: None,
-                        empty: p.empty_repo,
-                        web_url: p.web_url,
-                    },
-                    // The numeric id survives renames and transfers, and needs no escaping.
-                    locator: p.id.to_string(),
-                })
+                .map(Project::into_listed)
                 .collect(),
             next,
         })
@@ -211,6 +218,23 @@ impl Lister for Gitlab {
             .buffered(HEAD_CONCURRENCY)
             .try_collect()
             .await
+    }
+
+    /// `GET /projects/{id}`: by id, so a rename or a move between subgroups is followed. A
+    /// project moved out of the group, or scheduled for deletion, is no longer in the fleet.
+    async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError> {
+        let id = numeric_id(FORGE, external_id)?;
+        let url = format!("{}/projects/{id}", self.api);
+        match self.http.get_json::<Project>(&url).await {
+            Ok((_, Some(p)))
+                if within(&self.org, &p.path_with_namespace) && !p.pending_deletion() =>
+            {
+                Ok(Some(p.into_listed()))
+            }
+            Ok(_) => Ok(None),
+            Err(e) if e.class() == Some(Class::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -440,5 +464,32 @@ mod tests {
                 "GET /api/v4/projects/4/repository/branches/gone",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn get_follows_the_id_and_stays_in_the_group() {
+        let t = ScriptedTransport::new(|req| match req.uri().path() {
+            "/api/v4/projects/7" => {
+                ScriptedTransport::reply(200, project(7, "acme/platform/deep/moved").to_string())
+            }
+            "/api/v4/projects/8" => {
+                ScriptedTransport::reply(200, project(8, "acme/other/x").to_string())
+            }
+            "/api/v4/projects/9" => {
+                let mut p = project(9, "acme/platform/doomed");
+                p["marked_for_deletion_on"] = "2026-10-07".into();
+                ScriptedTransport::reply(200, p.to_string())
+            }
+            _ => ScriptedTransport::reply(404, r#"{"message":"404 Project Not Found"}"#),
+        });
+        let g = gitlab(t, "acme/platform");
+        let found = g.get("7").await.unwrap().unwrap();
+        assert_eq!(found.snapshot.full_name, "acme/platform/deep/moved");
+        assert!(
+            g.get("8").await.unwrap().is_none(),
+            "moved out of the group"
+        );
+        assert!(g.get("9").await.unwrap().is_none(), "pending deletion");
+        assert!(g.get("10").await.unwrap().is_none(), "deleted");
     }
 }

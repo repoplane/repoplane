@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use forgelab::forge::Settings;
-use repoplane_e2e::{ForgeSide, MARKER_TOPIC, Stack, compare, expected, sandbox};
+use repoplane_e2e::{ForgeSide, MARKER_TOPIC, ShiftingProxy, Stack, compare, expected, sandbox};
 use repoplane_proto::ForgeKind;
 use repoplane_proto::api::RepositoryStatus;
 
@@ -65,6 +65,12 @@ async fn inventory() {
             "repo list matches the example",
             false,
             Box::pin(table_output(&s)),
+        ),
+        ("direct lookup by id", false, Box::pin(direct_lookup(&s))),
+        (
+            "a repository skipped by a shifting listing stays active",
+            true,
+            Box::pin(shifting_listing(&s)),
         ),
         ("topic changed", true, Box::pin(topic_changed(&s))),
         ("commit pushed", true, Box::pin(commit_pushed(&s))),
@@ -217,6 +223,159 @@ async fn table_output(s: &Suite) -> anyhow::Result<()> {
     anyhow::ensure!(cols[1..4] == ["main", "false", "b8a1a303"], "{line}");
     anyhow::ensure!(cols[4..] == [MARKER_TOPIC, "node", "service"], "{line}");
     Ok(())
+}
+
+/// The lookup a run uses to confirm a repository the listing did not return: by the forge's
+/// id, it answers what the listing answered, and an id the forge never issued is gone.
+async fn direct_lookup(s: &Suite) -> anyhow::Result<()> {
+    let lister = s.side.lister()?;
+    let inventory = s.stack.repos(&s.connection, false).await?;
+    let mut diffs = Vec::new();
+    for path in [
+        "billing-api",
+        "archived",
+        "no-commits",
+        "master-branch",
+        "platform/core/api",
+        "acme/payments/gateway/api",
+    ] {
+        let name = s.side.full_name(path);
+        let r = inventory
+            .iter()
+            .find(|r| r.full_name == name)
+            .ok_or_else(|| anyhow::anyhow!("{name} missing from the inventory"))?;
+        let Some(got) = lister.get(&r.external_id).await? else {
+            diffs.push(format!("{name}: not found by id {}", r.external_id));
+            continue;
+        };
+        let g = got.snapshot;
+        let topics = g.topics.map(|mut t| {
+            t.sort();
+            t
+        });
+        let want = (
+            &r.full_name,
+            &r.default_branch,
+            r.archived,
+            &r.topics,
+            r.empty,
+        );
+        if (
+            &g.full_name,
+            &g.default_branch,
+            g.archived,
+            &topics,
+            g.empty,
+        ) != want
+        {
+            diffs.push(format!(
+                "{name}: by id {:?}, listed {want:?}",
+                (
+                    &g.full_name,
+                    &g.default_branch,
+                    g.archived,
+                    &topics,
+                    g.empty
+                )
+            ));
+        }
+    }
+    let never = match s.side.forge {
+        ForgeKind::Azuredevops => "5a1f3c2e-8b4d-4e6f-9a0b-1c2d3e4f5a6b",
+        _ => "999999999999",
+    };
+    if let Some(r) = lister.get(never).await? {
+        diffs.push(format!(
+            "id {never} was never issued, yet found {}",
+            r.snapshot.full_name
+        ));
+    }
+    anyhow::ensure!(diffs.is_empty(), "{}", diffs.join("\n"));
+    Ok(())
+}
+
+/// A repository deleted from page 1 while the worker is between pages shifts page 2 back by
+/// one, so the listing skips a repository that still exists. Only the deleted one may be
+/// marked inaccessible. Local only: the shift comes from a proxy in front of Forgejo.
+async fn shifting_listing(s: &Suite) -> anyhow::Result<()> {
+    if s.side.sandbox != "local" {
+        eprintln!("skipped: only on the local sandbox");
+        return Ok(());
+    }
+    let proxy = ShiftingProxy::start(&s.side).await?;
+    let conn = "e2e-local-shifting";
+    s.stack
+        .cli(&[
+            "connection",
+            "add",
+            "forgejo",
+            "--name",
+            conn,
+            "--org",
+            &s.side.org,
+            "--auth",
+            "token",
+            "--token-env",
+            &s.side.token_env,
+            "--base-url",
+            &proxy.base_url,
+        ])
+        .await?;
+    let first = s.stack.reconcile(conn).await?;
+    anyhow::ensure!(
+        first.discovered == 123,
+        "baseline through the proxy: {}",
+        first.discovered
+    );
+
+    proxy.arm();
+    let r = s.stack.reconcile(conn).await;
+    let outcome = async {
+        let r = r?;
+        let victim = proxy
+            .deleted
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the proxy never shifted the listing"))?;
+        let still_there: usize = s
+            .stack
+            .worker_log_field("did not return", "still_there")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // The victim sat on page 1, already read: this run saw it. What it did not see is the
+        // repository the shift pushed from page 2 onto page 1, which still exists.
+        anyhow::ensure!(
+            r.inaccessible == 0,
+            "inaccessible {}: a repository the listing skipped was marked",
+            r.inaccessible
+        );
+        anyhow::ensure!(
+            still_there == 1,
+            "want exactly the one skipped repository confirmed by id, got still_there={still_there}"
+        );
+        // The next run sees the deletion, and only that.
+        let next = s.stack.reconcile(conn).await?;
+        let all = s.stack.repos(conn, true).await?;
+        let gone: Vec<_> = all
+            .iter()
+            .filter(|r| r.status == RepositoryStatus::Inaccessible)
+            .map(|r| r.full_name.clone())
+            .collect();
+        anyhow::ensure!(
+            next.inaccessible == 1 && gone == [victim.clone()],
+            "next run marked {} ({gone:?}), want only {victim}",
+            next.inaccessible
+        );
+        eprintln!(
+            "deleted {victim}: the listing skipped one live repository, confirmed by id and kept"
+        );
+        Ok(())
+    }
+    .await;
+    // Both fleets go back whatever happened: the victim may be from either.
+    s.side.put_back("scale").await?;
+    outcome
 }
 
 /// A topic added on the forge shows up after the next reconcile, and nothing else moves.

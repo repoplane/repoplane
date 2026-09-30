@@ -172,6 +172,39 @@ impl Lister for AzureDevops {
             .try_collect()
             .await
     }
+
+    /// `GET {org}/_apis/git/repositories/{id}`: a repository id is unique across the
+    /// organisation's projects. A disabled repository answers that with a 404 as if it were
+    /// gone, so a 404 is checked against the organisation's listing, which does hold disabled
+    /// repositories, before it is believed.
+    async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError> {
+        if external_id.is_empty()
+            || !external_id
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b'-')
+        {
+            return Err(ForgeError::protocol(
+                FORGE,
+                format!("{external_id:?} is not a repository id"),
+            ));
+        }
+        let url = format!(
+            "{}/_apis/git/repositories/{external_id}?{API_VERSION}",
+            self.api
+        );
+        match self.http.get_json::<Repo>(&url).await {
+            Ok((_, Some(r))) => Ok(Some(self.listed(r))),
+            Ok((_, None)) => Ok(None),
+            Err(e) if e.class() == Some(Class::NotFound) => {
+                let listing = self.page(None).await?;
+                Ok(listing
+                    .repos
+                    .into_iter()
+                    .find(|l| l.snapshot.external_id.eq_ignore_ascii_case(external_id)))
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl AzureDevops {
@@ -456,5 +489,44 @@ mod tests {
             ado(t).heads(&[listed(Some("main"), false)]).await.unwrap(),
             vec![None]
         );
+    }
+
+    #[tokio::test]
+    async fn get_looks_a_repository_up_by_its_guid() {
+        let t = ScriptedTransport::new(|req| {
+            if req.uri().path() == "/org/_apis/git/repositories/0a1b-2c" {
+                ScriptedTransport::reply(
+                    200,
+                    repo("0a1b-2c", "fleet", "api", Some("refs/heads/main"), false).to_string(),
+                )
+            } else if req.uri().path() == "/org/_apis/git/repositories" {
+                ScriptedTransport::reply(200, r#"{"value": [], "count": 0}"#)
+            } else {
+                ScriptedTransport::reply(404, r#"{"message":"TF401019"}"#)
+            }
+        });
+        let a = ado(t);
+        let found = a.get("0a1b-2c").await.unwrap().unwrap();
+        assert_eq!(found.snapshot.full_name, "org/fleet/api");
+        assert_eq!(found.snapshot.default_branch.as_deref(), Some("main"));
+        assert!(a.get("ffff").await.unwrap().is_none());
+        assert!(a.get("../etc").await.is_err());
+    }
+
+    /// A disabled repository answers its own lookup with a 404; the listing still holds it.
+    #[tokio::test]
+    async fn get_finds_a_disabled_repository_through_the_listing() {
+        let t = ScriptedTransport::new(|req| {
+            if req.uri().path() == "/org/_apis/git/repositories" {
+                let v = serde_json::json!({"value": [repo("d1", "fleet", "archived", Some("refs/heads/main"), true)], "count": 1});
+                ScriptedTransport::reply(200, v.to_string())
+            } else {
+                ScriptedTransport::reply(404, r#"{"message":"TF401019"}"#)
+            }
+        });
+        let a = ado(t);
+        let found = a.get("d1").await.unwrap().unwrap();
+        assert!(found.snapshot.archived);
+        assert!(a.get("e2").await.unwrap().is_none());
     }
 }

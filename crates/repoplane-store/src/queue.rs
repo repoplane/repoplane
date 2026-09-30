@@ -231,6 +231,29 @@ impl Store {
         Ok(UploadOutcome { recorded })
     }
 
+    /// The repositories this run has not seen: active in the inventory, and not stamped with
+    /// the run's watermark. The worker confirms each with a direct lookup before completing.
+    pub async fn unseen(
+        &self,
+        task: TaskId,
+        lease_id: Uuid,
+        ttl_secs: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let mut tx = self.pool.begin().await?;
+        self.extend(&mut tx, task, lease_id, ttl_secs).await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "select r.external_id, r.full_name from repositories r
+             join reconciles rc on rc.connection_id = r.connection_id
+             where rc.task_id = $1 and r.status = 'active' and r.last_seen_at < rc.watermark
+             order by r.full_name",
+        )
+        .bind(task.uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(rows)
+    }
+
     /// Finishes a run. Only a complete listing marks the repositories it did not see as
     /// inaccessible; an incomplete one would mark whatever sat on the pages it never read.
     pub async fn complete(

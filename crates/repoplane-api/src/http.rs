@@ -15,7 +15,8 @@ use repoplane_proto::api::{
 };
 use repoplane_proto::id::{ReconcileId, TaskId};
 use repoplane_proto::worker::{
-    Complete, Fail, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload,
+    Complete, Fail, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload, Unseen, UnseenRepo,
+    UnseenRequest,
 };
 use repoplane_store::{RepoFilter, Store, StoreError};
 use serde::Deserialize;
@@ -48,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/lease", post(lease))
         .route("/tasks/{id}/heartbeat", post(heartbeat))
         .route("/tasks/{id}/pages", post(upload_page))
+        .route("/tasks/{id}/unseen", post(unseen))
         .route("/tasks/{id}/complete", post(complete))
         .route("/tasks/{id}/fail", post(fail));
     Router::new()
@@ -389,6 +391,28 @@ async fn upload_page(
         .await?;
     Ok(Json(PageAck {
         recorded: out.recorded,
+    }))
+}
+
+async fn unseen(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<UnseenRequest>,
+) -> ApiResult<Json<Unseen>> {
+    worker_queue(&s, &h)?;
+    let rows = s
+        .store
+        .unseen(task_id(&id)?, b.lease_id, LEASE_TTL_SECS)
+        .await?;
+    Ok(Json(Unseen {
+        repos: rows
+            .into_iter()
+            .map(|(external_id, full_name)| UnseenRepo {
+                external_id,
+                full_name,
+            })
+            .collect(),
     }))
 }
 

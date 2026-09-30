@@ -17,6 +17,7 @@ use crate::error::{Class, ForgeError};
 use crate::http::{HttpClient, Transport, classify_generic, header};
 use crate::{
     HEAD_CONCURRENCY, Listed, Lister, Page, Token, commit_id, escape_path, escape_segment, link,
+    numeric_id, within,
 };
 
 const FORGE: &str = "forgejo";
@@ -64,6 +65,26 @@ struct Repo {
     topics: Option<Vec<String>>,
     #[serde(default)]
     html_url: Option<String>,
+}
+
+impl Repo {
+    fn into_listed(self) -> Listed {
+        let owner_repo = self.full_name.clone();
+        Listed {
+            snapshot: RepoSnapshot {
+                external_id: self.id.to_string(),
+                full_name: self.full_name,
+                name: self.name,
+                default_branch: self.default_branch.filter(|b| !b.is_empty()),
+                archived: self.archived,
+                topics: Some(self.topics.unwrap_or_default()),
+                head: None,
+                empty: self.empty,
+                web_url: self.html_url,
+            },
+            locator: owner_repo,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -129,26 +150,7 @@ impl Lister for Forgejo {
         // An empty page ends the listing whatever the header says.
         let next = if repos.is_empty() { None } else { next };
         Ok(Page {
-            repos: repos
-                .into_iter()
-                .map(|r| {
-                    let owner_repo = r.full_name.clone();
-                    Listed {
-                        snapshot: RepoSnapshot {
-                            external_id: r.id.to_string(),
-                            full_name: r.full_name,
-                            name: r.name,
-                            default_branch: r.default_branch.filter(|b| !b.is_empty()),
-                            archived: r.archived,
-                            topics: Some(r.topics.unwrap_or_default()),
-                            head: None,
-                            empty: r.empty,
-                            web_url: r.html_url,
-                        },
-                        locator: owner_repo,
-                    }
-                })
-                .collect(),
+            repos: repos.into_iter().map(Repo::into_listed).collect(),
             next,
         })
     }
@@ -159,6 +161,19 @@ impl Lister for Forgejo {
             .buffered(HEAD_CONCURRENCY)
             .try_collect()
             .await
+    }
+
+    /// `GET /repositories/{id}`: by id, so a rename or a transfer is followed rather than
+    /// mistaken for a deletion.
+    async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError> {
+        let id = numeric_id(FORGE, external_id)?;
+        let url = format!("{}/repositories/{id}", self.api);
+        match self.http.get_json::<Repo>(&url).await {
+            Ok((_, Some(r))) if within(&self.org, &r.full_name) => Ok(Some(r.into_listed())),
+            Ok(_) => Ok(None),
+            Err(e) if e.class() == Some(Class::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -328,5 +343,29 @@ mod tests {
         let heads = f.heads(&listed).await.unwrap();
         assert_eq!(heads, vec![Some(sha.to_string()), None]);
         assert_eq!(t.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_follows_the_id_and_stays_in_the_org() {
+        let t = ScriptedTransport::new(|req| match req.uri().path() {
+            "/api/v1/repositories/7" => {
+                ScriptedTransport::reply(200, repo(7, "renamed", false).to_string())
+            }
+            "/api/v1/repositories/8" => {
+                let mut r = repo(8, "x", false);
+                r["full_name"] = "elsewhere/x".into();
+                ScriptedTransport::reply(200, r.to_string())
+            }
+            _ => ScriptedTransport::reply(404, "{}"),
+        });
+        let f = forgejo(t);
+        let found = f.get("7").await.unwrap().unwrap();
+        assert_eq!(found.snapshot.full_name, "acme/renamed");
+        assert!(
+            f.get("8").await.unwrap().is_none(),
+            "transferred out of the org"
+        );
+        assert!(f.get("9").await.unwrap().is_none(), "deleted");
+        assert!(f.get("not-an-id").await.is_err());
     }
 }

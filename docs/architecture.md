@@ -79,7 +79,7 @@ networks put in the way ([ADR 0008](adr/0008-http-task-queues.md)).
 | Component | Responsibility |
 |---|---|
 | `http` public (`/v1`) | connections, reconciles (with `?wait=` long-poll), repositories (filtered, keyset-paged). Admin bearer token. |
-| `http` worker (`/v1/worker`) | lease, heartbeat, page upload, complete, fail. One bearer token per queue; every call after the lease names the lease id. |
+| `http` worker (`/v1/worker`) | lease, heartbeat, page upload, unseen, complete, fail. One bearer token per queue; every call after the lease names the lease id. |
 | `store` queue | Postgres task queue: `FOR UPDATE SKIP LOCKED` leases with a TTL, re-lease on expiry, bounded retries. |
 | `store` inventory | upsert keyed on `(connection, forge id)`, a per-run watermark, and inaccessible marking after a complete listing only. |
 | `store` migrations | embedded; applied by `repoplane-api migrate` only; `serve` refuses a schema other than its own. |
@@ -89,7 +89,7 @@ networks put in the way ([ADR 0008](adr/0008-http-task-queues.md)).
 | Component | Responsibility |
 |---|---|
 | poller | lease loop, bounded concurrency, graceful shutdown (in-flight forge calls are cancelled, and the task goes back on the queue) |
-| reconcile | page → HEADs → upload, repeated to the last page, then complete; a background heartbeat keeps the lease through long rate-limit pauses |
+| reconcile | page → HEADs → upload, repeated to the last page; then every repository the run did not see is looked up by id, and those still there are uploaded; then complete. A background heartbeat keeps the lease through long rate-limit pauses |
 | `repoplane-forge` | the four `Lister` adapters and the shared HTTP layer |
 
 ### repoplane-forge
@@ -99,6 +99,7 @@ trait Lister {
     fn kind(&self) -> ForgeKind;                                       // and so its Caps
     async fn page(&self, cursor: Option<&str>) -> Result<Page, ForgeError>;
     async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError>;
+    async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError>;  // by forge id
 }
 ```
 
@@ -163,12 +164,6 @@ inventory back to the locks. See [`../tests/e2e`](../tests/e2e) and the README.
 
 ## Known gaps
 
-- **Offset pagination can skip a repository.** On Forgejo, GitHub and GitLab, a repository
-  deleted mid-listing shifts later pages back by one, so one repository can go unseen during an
-  otherwise complete listing. That repository is then marked inaccessible until the next
-  reconcile sees it again. The candidate fix is to confirm a missing repository with a direct
-  lookup before marking it; it needs a `get` per adapter, and is recorded in
-  [ADR 0005](adr/0005-conservative-reconciliation.md).
 - Listing pages are fetched one after another. For fleets in the thousands, planned page
   fan-out (the Go draft's approach) comes later.
 - No rate budget is shared across workers yet: each HTTP client waits out the limits it meets.

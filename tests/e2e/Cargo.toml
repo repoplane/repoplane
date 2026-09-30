@@ -17,7 +17,11 @@ path = "e2e.rs"
 # pins its release.
 [dependencies]
 repoplane-proto.workspace = true
+repoplane-forge.workspace = true
+tokio-util.workspace = true
 anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
 base64.workspace = true
 reqwest.workspace = true
 serde.workspace = true

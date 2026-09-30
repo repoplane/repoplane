@@ -11,6 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use axum::response::IntoResponse as _;
 use base64::Engine as _;
 use forgelab::fleet::read_lock;
 use forgelab::forge::GitRemote;
@@ -191,6 +192,23 @@ impl ForgeSide {
             _tmp: Some(tmp),
             _forgejo: Some(container),
         })
+    }
+
+    /// A repoplane forge client for this sandbox, for checking an adapter directly.
+    pub fn lister(&self) -> anyhow::Result<Box<dyn repoplane_forge::Lister>> {
+        let spec = repoplane_proto::worker::ConnectionSpec {
+            id: repoplane_proto::id::ConnectionId::new(),
+            forge: self.forge,
+            org: self.org.clone(),
+            base_url: self.base_url.clone(),
+            token_env: self.token_env.clone(),
+        };
+        Ok(repoplane_forge::lister_with_token(
+            &spec,
+            repoplane_forge::Token::new(self.token.expose_secret())?,
+            repoplane_forge::ReqwestTransport::new()?,
+            tokio_util::sync::CancellationToken::new(),
+        )?)
     }
 
     /// The token, for the worker's environment only.
@@ -404,6 +422,28 @@ fn free_port() -> anyhow::Result<u16> {
 }
 
 impl Stack {
+    /// The fields of the worker's latest log line containing `message`, ANSI colour removed.
+    pub fn worker_log_field(&self, message: &str, field: &str) -> Option<String> {
+        let raw = std::fs::read_to_string(self.logs.join("worker.log")).ok()?;
+        let mut plain = String::with_capacity(raw.len());
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for d in chars.by_ref() {
+                    if d == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        let line = plain.lines().rev().find(|l| l.contains(message))?;
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
+            .map(str::to_string)
+    }
+
     /// Postgres in a container; the API and the worker as real processes, the worker with the
     /// forge token in its environment and the API without it.
     pub async fn start(forge_token: (String, String)) -> anyhow::Result<Stack> {
@@ -676,4 +716,136 @@ pub fn compare(
         .map(|r| r.full_name.clone())
         .collect();
     (diffs, extras)
+}
+
+// --- a forge that shifts under a listing ---------------------------------------------------
+
+/// A proxy in front of Forgejo that deletes a repository from page 1 of the organisation
+/// listing the moment page 2 is asked for, so every later page shifts back by one and the
+/// listing skips a repository that still exists: the race ADR 0005 guards against, made
+/// deterministic.
+pub struct ShiftingProxy {
+    pub base_url: String,
+    /// The repository deleted, once it has been.
+    pub deleted: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ShiftingProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[derive(Clone)]
+struct ProxyState {
+    upstream: String,
+    listing: String,
+    token: String,
+    http: reqwest::Client,
+    page_one: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    deleted: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ShiftingProxy {
+    pub async fn start(side: &ForgeSide) -> anyhow::Result<ShiftingProxy> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state = ProxyState {
+            upstream: side.base_url.clone(),
+            listing: format!("/api/v1/orgs/{}/repos", side.org),
+            token: side.token.expose_secret().to_string(),
+            http: reqwest::Client::new(),
+            page_one: Default::default(),
+            deleted: deleted.clone(),
+            armed: armed.clone(),
+        };
+        let app = axum::Router::new().fallback(forward).with_state(state);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(ShiftingProxy {
+            base_url,
+            deleted,
+            armed,
+            task,
+        })
+    }
+
+    /// From now on, the next listing that reaches page 2 shifts.
+    pub fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn forward(
+    axum::extract::State(s): axum::extract::State<ProxyState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> axum::response::Response {
+    let pq = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let listing = method == axum::http::Method::GET && uri.path() == s.listing;
+    let page = uri
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("page=")))
+        .unwrap_or("1")
+        .to_string();
+    if listing && page == "2" && s.armed.load(std::sync::atomic::Ordering::SeqCst) {
+        let victim = s.page_one.lock().unwrap().first().cloned();
+        let first_time = s.deleted.lock().unwrap().is_none();
+        if let (Some(victim), true) = (victim, first_time) {
+            let status = s
+                .http
+                .delete(format!("{}/api/v1/repos/{victim}", s.upstream))
+                .header("authorization", format!("token {}", s.token))
+                .send()
+                .await
+                .map(|r| r.status().as_u16());
+            eprintln!("shifting proxy: deleted {victim} before page 2: {status:?}");
+            *s.deleted.lock().unwrap() = Some(victim);
+        }
+    }
+    let mut req = s
+        .http
+        .request(method, format!("{}{pq}", s.upstream))
+        .body(body);
+    for (k, v) in &headers {
+        if !matches!(k.as_str(), "host" | "accept-encoding" | "content-length") {
+            req = req.header(k, v);
+        }
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return (axum::http::StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+    let status = resp.status();
+    let mut out_headers = axum::http::HeaderMap::new();
+    for (k, v) in resp.headers() {
+        if !matches!(
+            k.as_str(),
+            "transfer-encoding" | "connection" | "content-length" | "content-encoding"
+        ) {
+            out_headers.insert(k, v.clone());
+        }
+    }
+    let bytes = resp.bytes().await.unwrap_or_default();
+    if listing && page == "1" {
+        let names: Vec<String> = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| r["full_name"].as_str().map(str::to_string))
+            .collect();
+        *s.page_one.lock().unwrap() = names;
+    }
+    (status, out_headers, bytes).into_response()
 }

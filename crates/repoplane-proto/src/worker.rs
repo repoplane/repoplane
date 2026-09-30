@@ -70,6 +70,27 @@ pub struct PageAck {
     pub recorded: i64,
 }
 
+/// Asks which repositories the inventory holds for this connection that the run has not seen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnseenRequest {
+    pub lease_id: Uuid,
+}
+
+/// Repositories the inventory holds as active that this run's listing did not return. Before
+/// completing, the worker looks each up by id: a listing paged by offset skips a repository
+/// when another is deleted mid-listing, and only the ones the forge confirms gone may be marked
+/// inaccessible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Unseen {
+    pub repos: Vec<UnseenRepo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnseenRepo {
+    pub external_id: String,
+    pub full_name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub lease_id: Uuid,

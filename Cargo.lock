@@ -2410,8 +2410,11 @@ name = "repoplane-e2e"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.22.1",
+ "bytes",
  "forgelab",
+ "repoplane-forge",
  "repoplane-proto",
  "reqwest",
  "secrecy",
@@ -2420,6 +2423,7 @@ dependencies = [
  "tempfile",
  "testcontainers",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2473,7 +2477,9 @@ name = "repoplane-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
+ "futures",
  "repoplane-forge",
  "repoplane-proto",
  "reqwest",

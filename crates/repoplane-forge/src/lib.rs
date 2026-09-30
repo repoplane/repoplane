@@ -60,6 +60,27 @@ pub trait Lister: Send + Sync {
     /// empty repository, or one the forge will not read (a disabled Azure DevOps repository).
     /// Batched where the forge allows it.
     async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError>;
+
+    /// Looks one repository up by the forge's own id, outside the listing. `None` when the
+    /// forge says it is gone, or it now belongs to another organisation.
+    ///
+    /// A listing paged by offset can skip a repository when another is deleted while it runs:
+    /// every later page shifts back by one. Before a run marks a repository inaccessible, the
+    /// worker asks here whether it really is gone (ADR 0005).
+    async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError>;
+}
+
+/// True when `full_name` sits inside the organisation or group `org` (case-insensitive, as the
+/// forges treat owner names).
+pub fn within(org: &str, full_name: &str) -> bool {
+    let prefix = format!("{}/", org.trim_matches('/'));
+    full_name.len() > prefix.len() && full_name[..prefix.len()].eq_ignore_ascii_case(&prefix)
+}
+
+/// A numeric forge id, as GitHub, GitLab and Forgejo use.
+pub fn numeric_id(forge: &'static str, id: &str) -> Result<u64, ForgeError> {
+    id.parse()
+        .map_err(|_| ForgeError::protocol(forge, format!("{id:?} is not a repository id")))
 }
 
 /// The adapter for a connection. The token is read here, in the worker, from the variable the
@@ -158,6 +179,16 @@ mod tests {
         assert_eq!(escape_segment("a b/c"), "a%20b%2Fc");
         assert_eq!(escape_path("release/v2"), "release/v2");
         assert_eq!(escape_path("feat/a b"), "feat/a%20b");
+    }
+
+    #[test]
+    fn membership() {
+        assert!(within("acme", "acme/api"));
+        assert!(within("Acme", "acme/api"));
+        assert!(within("acme/platform", "acme/platform/core/api"));
+        assert!(!within("acme", "acme-labs/api"));
+        assert!(!within("acme", "acme/"));
+        assert!(!within("acme/platform", "acme/api"));
     }
 
     #[test]

@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Class, ForgeError};
 use crate::http::{HttpClient, Transport, Verdict, classify_generic, header, retry_after};
-use crate::{Listed, Lister, Page, Token, commit_id, escape_segment, link};
+use crate::{Listed, Lister, Page, Token, commit_id, escape_segment, link, numeric_id, within};
 
 const FORGE: &str = "github";
 const PAGE_SIZE: u32 = 100;
@@ -128,6 +128,27 @@ impl Repo {
     }
 }
 
+impl Repo {
+    fn into_listed(self) -> Listed {
+        let empty = self.looks_empty();
+        let locator = self.full_name.clone();
+        Listed {
+            snapshot: RepoSnapshot {
+                external_id: self.id.to_string(),
+                full_name: self.full_name,
+                name: self.name,
+                default_branch: self.default_branch.filter(|b| !b.is_empty()),
+                archived: self.archived,
+                topics: Some(self.topics.unwrap_or_default()),
+                head: None,
+                empty,
+                web_url: self.html_url,
+            },
+            locator,
+        }
+    }
+}
+
 #[async_trait]
 impl Lister for Github {
     fn kind(&self) -> ForgeKind {
@@ -163,24 +184,7 @@ impl Lister for Github {
             repos: repos
                 .unwrap_or_default()
                 .into_iter()
-                .map(|r| {
-                    let empty = r.looks_empty();
-                    let locator = r.full_name.clone();
-                    Listed {
-                        snapshot: RepoSnapshot {
-                            external_id: r.id.to_string(),
-                            full_name: r.full_name,
-                            name: r.name,
-                            default_branch: r.default_branch.filter(|b| !b.is_empty()),
-                            archived: r.archived,
-                            topics: Some(r.topics.unwrap_or_default()),
-                            head: None,
-                            empty,
-                            web_url: r.html_url,
-                        },
-                        locator,
-                    }
-                })
+                .map(Repo::into_listed)
                 .collect(),
             next,
         })
@@ -196,6 +200,19 @@ impl Lister for Github {
             .try_collect()
             .await?;
         Ok(batches.into_iter().flatten().collect())
+    }
+
+    /// `GET /repositories/{id}`: by id, so a rename or a transfer is followed rather than
+    /// mistaken for a deletion. A repository transferred to another owner is no longer ours.
+    async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError> {
+        let id = numeric_id(FORGE, external_id)?;
+        let url = format!("{}/repositories/{id}", self.api);
+        match self.http.get_json::<Repo>(&url).await {
+            Ok((_, Some(r))) if within(&self.org, &r.full_name) => Ok(Some(r.into_listed())),
+            Ok(_) => Ok(None),
+            Err(e) if e.class() == Some(Class::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -748,5 +765,31 @@ mod tests {
         assert_eq!(err.class(), Some(Class::Forbidden));
         assert!(!err.retryable());
         assert_eq!(t.seen().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_follows_the_id_and_stays_in_the_org() {
+        let t = ScriptedTransport::new(|req| match req.uri().path() {
+            "/repositories/7" => ScriptedTransport::reply(200, repo(7, "renamed").to_string()),
+            "/repositories/8" => {
+                let mut r = repo(8, "x");
+                r["full_name"] = "someone-else/x".into();
+                ScriptedTransport::reply(200, r.to_string())
+            }
+            _ => ScriptedTransport::reply(404, r#"{"message":"Not Found"}"#),
+        });
+        let g = github(t);
+        let found = g.get("7").await.unwrap().unwrap();
+        assert_eq!(found.snapshot.full_name, "acme/renamed");
+        assert_eq!(
+            found.snapshot.topics.as_deref(),
+            Some(&["service".to_string()][..])
+        );
+        assert!(
+            g.get("8").await.unwrap().is_none(),
+            "transferred out of the org"
+        );
+        assert!(g.get("9").await.unwrap().is_none(), "deleted");
+        assert!(g.get("x").await.is_err());
     }
 }

@@ -6,7 +6,7 @@ use anyhow::Context;
 use repoplane_proto::api::ErrorBody;
 use repoplane_proto::id::TaskId;
 use repoplane_proto::worker::{
-    Complete, Fail, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload,
+    Complete, Fail, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload, Unseen, UnseenRequest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -77,6 +77,19 @@ impl Api {
             .send()
             .await
             .context("upload page")?;
+        read(resp).await
+    }
+
+    pub async fn unseen(&self, task: TaskId, lease_id: Uuid) -> anyhow::Result<Unseen> {
+        let resp = self
+            .http
+            .post(format!("{}/tasks/{task}/unseen", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(60))
+            .json(&UnseenRequest { lease_id })
+            .send()
+            .await
+            .context("unseen")?;
         read(resp).await
     }
 
