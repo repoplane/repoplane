@@ -1,7 +1,8 @@
 //! Azure DevOps: `GET {org}/_apis/git/repositories`, one call for every repository of every
 //! project in the organisation, disabled ones included. That endpoint takes no `$top` and
-//! answers no continuation token, so a listing is a single page. A HEAD costs one Refs request
-//! per repository; a disabled repository answers 404 to it, so it is never asked.
+//! answers no continuation token, so a listing is a single page. HEADs are read over git
+//! (`ls-remote`), outside the load Azure DevOps meters per user; a disabled repository refuses
+//! every read, so it is never asked.
 //!
 //! A bad token is not a 401 here: the forge redirects to a sign-in page, which a client that
 //! follows redirects receives as a 203 of HTML. `X-TFS-FedAuthRedirect: Suppress` asks for a
@@ -14,7 +15,6 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use http::{HeaderMap, Response};
 use repoplane_proto::ForgeKind;
 use repoplane_proto::inventory::RepoSnapshot;
@@ -22,10 +22,9 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Class, ForgeError};
+use crate::git::{self, GitAuth};
 use crate::http::{HttpClient, Transport, Verdict, classify_generic, header};
-use crate::{
-    HEAD_CONCURRENCY, Listed, Lister, Page, Token, commit_id, escape_path, escape_segment,
-};
+use crate::{Listed, Lister, Page, Token, escape_segment, readable_branch};
 
 const FORGE: &str = "azuredevops";
 const API_VERSION: &str = "api-version=7.1";
@@ -35,7 +34,9 @@ pub struct AzureDevops {
     http: HttpClient,
     /// `{base}/{org}`: every API path hangs off the organisation.
     api: String,
+    base: String,
     org: String,
+    git: GitAuth,
 }
 
 impl AzureDevops {
@@ -60,9 +61,15 @@ impl AzureDevops {
         let (k, v) = header("x-tfs-fedauthredirect", "Suppress")?;
         headers.insert(k, v);
         Ok(AzureDevops {
-            http: HttpClient::new(FORGE, transport, classify, headers, token, cancel),
+            http: HttpClient::new(FORGE, transport, classify, headers, token.clone(), cancel),
             api: format!("{base}/{}", escape_segment(org)),
+            base: base.to_string(),
             org: org.to_string(),
+            // Azure DevOps takes the PAT as the password, under any username.
+            git: GitAuth {
+                username: "repoplane",
+                token,
+            },
         })
     }
 }
@@ -122,18 +129,6 @@ struct Project {
     name: String,
 }
 
-#[derive(Deserialize)]
-struct Refs {
-    value: Vec<Ref>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Ref {
-    name: String,
-    object_id: String,
-}
-
 #[async_trait]
 impl Lister for AzureDevops {
     fn kind(&self) -> ForgeKind {
@@ -166,11 +161,11 @@ impl Lister for AzureDevops {
     }
 
     async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let lookups: Vec<_> = repos.iter().map(|r| self.head(r)).collect();
-        stream::iter(lookups)
-            .buffered(HEAD_CONCURRENCY)
-            .try_collect()
-            .await
+        let remotes = repos
+            .iter()
+            .map(|r| self.remote(&r.snapshot))
+            .collect::<Result<Vec<_>, _>>()?;
+        git::heads(FORGE, remotes, &self.git).await
     }
 
     /// `GET {org}/_apis/git/repositories/{id}`: a repository id is unique across the
@@ -232,40 +227,22 @@ impl AzureDevops {
         }
     }
 
-    async fn head(&self, r: &Listed) -> Result<Option<String>, ForgeError> {
-        let s = &r.snapshot;
-        // A disabled repository refuses every read, so it is not asked.
-        let Some(branch) = s
-            .default_branch
-            .as_deref()
-            .filter(|_| !s.empty && !s.archived)
-        else {
+    /// `{base}/{org}/{project}/_git/{repo}`, from the configured base and the repository's
+    /// full name, never from a URL the forge sent. A disabled repository refuses every read, so
+    /// it is not asked.
+    fn remote(&self, s: &RepoSnapshot) -> Result<Option<git::Remote>, ForgeError> {
+        let Some(branch) = readable_branch(s).filter(|_| !s.archived) else {
             return Ok(None);
         };
-        let (project, repo) = r.snapshot.locator.split_once('/').ok_or_else(|| {
-            ForgeError::protocol(FORGE, format!("locator {:?}", r.snapshot.locator))
-        })?;
-        let url = format!(
-            "{}/{}/_apis/git/repositories/{}/refs?filter=heads/{}&{API_VERSION}",
-            self.api,
-            escape_segment(project),
-            escape_segment(repo),
-            escape_path(branch)
-        );
-        match self.http.get_json::<Refs>(&url).await {
-            Ok((_, refs)) => {
-                // `filter` is a prefix: `heads/main` also matches `heads/maintenance`.
-                let want = format!("{HEADS}{branch}");
-                let found = refs
-                    .into_iter()
-                    .flat_map(|r| r.value)
-                    .find(|r| r.name == want);
-                found.map(|r| commit_id(FORGE, &r.object_id)).transpose()
-            }
-            // Deleted or disabled between the listing and now: no HEAD to record.
-            Err(e) if e.class() == Some(Class::NotFound) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let (project, name) = s
+            .full_name
+            .strip_prefix(&format!("{}/", self.org))
+            .and_then(|rest| rest.split_once('/'))
+            .ok_or_else(|| ForgeError::protocol(FORGE, format!("full name {:?}", s.full_name)))?;
+        Ok(Some(git::Remote {
+            url: git::remote_url(&self.base, &[&self.org, project, "_git", name])?,
+            branch: branch.to_string(),
+        }))
     }
 }
 
@@ -273,9 +250,6 @@ impl AzureDevops {
 mod tests {
     use super::*;
     use crate::http::ScriptedTransport;
-
-    const SHA: &str = "b8a1a303d868e0bc2ed18bc8a39aaeb6fe8c5147";
-    const OTHER: &str = "841526d4bd7346b1eab08f010dd62ff154234504";
 
     fn repo(
         id: &str,
@@ -433,58 +407,26 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn head_picks_the_exact_ref_not_a_prefix_match() {
-        let t = ScriptedTransport::new(|req| {
-            assert_eq!(
-                req.uri().path_and_query().unwrap().as_str(),
-                "/org/p1/_apis/git/repositories/r1/refs?filter=heads/main&api-version=7.1"
-            );
-            ScriptedTransport::reply(
-                200,
-                serde_json::json!({"count": 2, "value": [
-                    {"name": "refs/heads/maintenance", "objectId": OTHER},
-                    {"name": "refs/heads/main", "objectId": SHA.to_uppercase()},
-                ]})
-                .to_string(),
-            )
-        });
-        let heads = ado(t).heads(&[listed(Some("main"), false)]).await.unwrap();
-        assert_eq!(heads, vec![Some(SHA.to_string())]);
-    }
-
-    #[tokio::test]
-    async fn only_a_prefix_match_means_no_head() {
-        let t = ScriptedTransport::new(|_| {
-            ScriptedTransport::reply(
-                200,
-                serde_json::json!({"value": [{"name": "refs/heads/maintenance", "objectId": OTHER}]}).to_string(),
-            )
-        });
+    #[test]
+    fn remotes_skip_disabled_and_empty_repositories() {
+        let a = ado(ScriptedTransport::new(|_| panic!("no request expected")));
+        let mut s = listed(Some("main"), false).snapshot;
+        s.full_name = "org/my project/a b".into();
+        let r = a.remote(&s).unwrap().unwrap();
         assert_eq!(
-            ado(t).heads(&[listed(Some("main"), false)]).await.unwrap(),
-            vec![None]
+            r.url.as_str(),
+            "https://dev.azure.com/org/my%20project/_git/a%20b"
         );
-    }
-
-    #[tokio::test]
-    async fn disabled_and_empty_repositories_are_not_asked() {
-        let t = ScriptedTransport::new(|_| panic!("no request expected"));
-        let heads = ado(t.clone())
-            .heads(&[listed(Some("main"), true), listed(None, false)])
-            .await
-            .unwrap();
-        assert_eq!(heads, vec![None, None]);
-        assert!(t.seen().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_repository_gone_since_the_listing_has_no_head() {
-        let t =
-            ScriptedTransport::new(|_| ScriptedTransport::reply(404, r#"{"message":"TF401019"}"#));
-        assert_eq!(
-            ado(t).heads(&[listed(Some("main"), false)]).await.unwrap(),
-            vec![None]
+        assert_eq!(r.branch, "main");
+        assert!(
+            a.remote(&listed(Some("main"), true).snapshot)
+                .unwrap()
+                .is_none(),
+            "disabled"
+        );
+        assert!(
+            a.remote(&listed(None, false).snapshot).unwrap().is_none(),
+            "empty"
         );
     }
 

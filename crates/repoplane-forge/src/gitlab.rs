@@ -8,14 +8,14 @@
 //! would only pretend. Ordering by id keeps pages stable while projects are created; totals are
 //! never read, since gitlab.com drops `X-Total` beyond 10,000 projects.
 //!
-//! A HEAD costs one request per project: there is no batch REST endpoint, and the GraphQL
-//! `tree { lastCommit }` batch took 19s for 100 projects on gitlab.com against about 6s for the
-//! same HEADs over REST, uncomfortably close to GraphQL's 30s timeout.
+//! HEADs are read over git (`ls-remote`), one request per project but outside the API rate
+//! limits: gitlab.com's Free plan allows 100 API requests a minute. (The GraphQL `tree {
+//! lastCommit }` batch was measured and rejected: 19s for 100 projects, near GraphQL's 30s
+//! timeout, and `lastCommit` is not strictly the branch tip.)
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use http::HeaderMap;
 use repoplane_proto::ForgeKind;
 use repoplane_proto::inventory::RepoSnapshot;
@@ -23,10 +23,10 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Class, ForgeError};
+use crate::git::{self, GitAuth};
 use crate::http::{HttpClient, Transport, classify_generic, header};
 use crate::{
-    HEAD_CONCURRENCY, Listed, Lister, Page, Token, commit_id, escape_segment, link, numeric_id,
-    within,
+    Listed, Lister, Page, Token, escape_segment, link, numeric_id, readable_branch, within,
 };
 
 const FORGE: &str = "gitlab";
@@ -35,7 +35,9 @@ const PAGE_SIZE: u32 = 100;
 pub struct Gitlab {
     http: HttpClient,
     api: String,
+    base: String,
     org: String,
+    git: GitAuth,
 }
 
 impl Gitlab {
@@ -57,9 +59,21 @@ impl Gitlab {
         headers.insert(k, v);
         Ok(Gitlab {
             // GitLab's 429 carries `Retry-After` in seconds, which the generic reading honours.
-            http: HttpClient::new(FORGE, transport, classify_generic, headers, token, cancel),
+            http: HttpClient::new(
+                FORGE,
+                transport,
+                classify_generic,
+                headers,
+                token.clone(),
+                cancel,
+            ),
             api: format!("{base}/api/v4"),
+            base: base.to_string(),
             org: org.trim_matches('/').to_string(),
+            git: GitAuth {
+                username: "oauth2",
+                token,
+            },
         })
     }
 
@@ -118,16 +132,6 @@ impl Project {
     fn pending_deletion(&self) -> bool {
         self.marked_for_deletion_on.is_some() || self.marked_for_deletion_at.is_some()
     }
-}
-
-#[derive(Deserialize)]
-struct Branch {
-    commit: BranchCommit,
-}
-
-#[derive(Deserialize)]
-struct BranchCommit {
-    id: String,
 }
 
 /// The `page` a listing URL asks for; 1 when it does not say.
@@ -212,11 +216,11 @@ impl Lister for Gitlab {
     }
 
     async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let lookups: Vec<_> = repos.iter().map(|r| self.head(r)).collect();
-        stream::iter(lookups)
-            .buffered(HEAD_CONCURRENCY)
-            .try_collect()
-            .await
+        let remotes = repos
+            .iter()
+            .map(|r| self.remote(&r.snapshot))
+            .collect::<Result<Vec<_>, _>>()?;
+        git::heads(FORGE, remotes, &self.git).await
     }
 
     /// `GET /projects/{id}`: by id, so a rename or a move between subgroups is followed. A
@@ -238,26 +242,23 @@ impl Lister for Gitlab {
 }
 
 impl Gitlab {
-    async fn head(&self, r: &Listed) -> Result<Option<String>, ForgeError> {
-        let s = &r.snapshot;
-        let Some(branch) = s.default_branch.as_deref().filter(|_| !s.empty) else {
+    /// `{base}/{group}/{subgroups…}/{project}.git`, from the project's full path and the
+    /// configured base, never from a URL the forge sent.
+    fn remote(&self, s: &RepoSnapshot) -> Result<Option<git::Remote>, ForgeError> {
+        let Some(branch) = readable_branch(s) else {
             return Ok(None);
         };
-        // GitLab wants the whole branch name as one segment: `release%2Fv2`. Kept as
-        // `release/v2`, the route itself does not match, and the 404 would pass for "no HEAD".
-        let url = format!(
-            "{}/projects/{}/repository/branches/{}",
-            self.api,
-            escape_segment(&r.snapshot.locator),
-            escape_segment(branch)
-        );
-        match self.http.get_json::<Branch>(&url).await {
-            Ok((_, Some(b))) => commit_id(FORGE, &b.commit.id).map(Some),
-            Ok((_, None)) => Ok(None),
-            // Listed as non-empty, yet the default branch (or the project) is gone.
-            Err(e) if e.class() == Some(Class::NotFound) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let mut segments: Vec<String> = s.full_name.split('/').map(str::to_string).collect();
+        let last = segments
+            .pop()
+            .filter(|l| !l.is_empty())
+            .ok_or_else(|| ForgeError::protocol(FORGE, format!("full path {:?}", s.full_name)))?;
+        segments.push(format!("{last}.git"));
+        let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+        Ok(Some(git::Remote {
+            url: git::remote_url(&self.base, &segments)?,
+            branch: branch.to_string(),
+        }))
     }
 }
 
@@ -265,8 +266,6 @@ impl Gitlab {
 mod tests {
     use super::*;
     use crate::http::ScriptedTransport;
-
-    const SHA: &str = "b8a1a303d868e0bc2ed18bc8a39aaeb6fe8c5147";
 
     fn project(id: i64, path: &str) -> serde_json::Value {
         let name = path.rsplit('/').next().unwrap();
@@ -435,32 +434,25 @@ mod tests {
         assert!(p.next.is_none());
     }
 
-    #[tokio::test]
-    async fn heads_skip_empty_projects_and_escape_the_branch_whole() {
-        let t = ScriptedTransport::new(|req| {
-            if req.uri().path().ends_with("/branches/gone") {
-                return ScriptedTransport::reply(404, r#"{"message":"404 Branch Not Found"}"#);
-            }
-            ScriptedTransport::reply(
-                200,
-                serde_json::json!({"commit": {"id": SHA.to_uppercase()}}).to_string(),
-            )
-        });
-        let g = gitlab(t.clone(), "acme");
-        let repos = [
-            listed("1", Some("release/v2"), false),
-            listed("2", Some("main"), true),
-            listed("3", None, false),
-            listed("4", Some("gone"), false),
-        ];
-        let heads = g.heads(&repos).await.unwrap();
-        assert_eq!(heads, vec![Some(SHA.to_string()), None, None, None]);
-        assert_eq!(
-            t.seen(),
-            vec![
-                "GET /api/v4/projects/1/repository/branches/release%2Fv2",
-                "GET /api/v4/projects/4/repository/branches/gone",
-            ]
+    #[test]
+    fn remotes_follow_the_full_path_and_skip_what_has_no_head() {
+        let g = gitlab(
+            ScriptedTransport::new(|_| ScriptedTransport::reply(200, "[]")),
+            "acme",
+        );
+        let p: Project = serde_json::from_value(project(1, "acme/platform/core/api")).unwrap();
+        let r = g.remote(&p.into_listed().snapshot).unwrap().unwrap();
+        assert_eq!(r.url.as_str(), "http://g/acme/platform/core/api.git");
+        assert_eq!(r.branch, "main");
+        assert!(
+            g.remote(&listed("2", Some("main"), true).snapshot)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            g.remote(&listed("3", None, false).snapshot)
+                .unwrap()
+                .is_none()
         );
     }
 

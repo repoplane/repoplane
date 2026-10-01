@@ -1,12 +1,11 @@
 //! Forgejo (and Gitea): `GET /api/v1/orgs/{org}/repos`, pages followed by their `Link` header.
 //! The server clamps `limit` to its own maximum (50 by default) whatever is asked, so the page
-//! size is never assumed; topics come with each repository; a HEAD costs one request per
-//! repository, since there is no batch endpoint.
+//! size is never assumed; topics come with each repository. HEADs are read over git
+//! (`ls-remote`), which the forge's API rate limits do not count.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use http::HeaderMap;
 use repoplane_proto::ForgeKind;
 use repoplane_proto::inventory::RepoSnapshot;
@@ -14,10 +13,10 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Class, ForgeError};
+use crate::git::{self, GitAuth};
 use crate::http::{HttpClient, Transport, classify_generic, header};
 use crate::{
-    HEAD_CONCURRENCY, Listed, Lister, Page, Token, commit_id, escape_path, escape_segment, link,
-    numeric_id, within,
+    Listed, Lister, Page, Token, escape_segment, link, numeric_id, readable_branch, within,
 };
 
 const FORGE: &str = "forgejo";
@@ -26,7 +25,9 @@ const PAGE_SIZE: u32 = 50;
 pub struct Forgejo {
     http: HttpClient,
     api: String,
+    base: String,
     org: String,
+    git: GitAuth,
 }
 
 impl Forgejo {
@@ -43,9 +44,22 @@ impl Forgejo {
         let (k, v) = header("accept", "application/json")?;
         headers.insert(k, v);
         Ok(Forgejo {
-            http: HttpClient::new(FORGE, transport, classify_generic, headers, token, cancel),
+            http: HttpClient::new(
+                FORGE,
+                transport,
+                classify_generic,
+                headers,
+                token.clone(),
+                cancel,
+            ),
             api: format!("{}/api/v1", base_url.trim_end_matches('/')),
+            base: base_url.trim_end_matches('/').to_string(),
             org: org.to_string(),
+            // Forgejo takes the token as the password, under any username.
+            git: GitAuth {
+                username: "repoplane",
+                token,
+            },
         })
     }
 }
@@ -84,16 +98,6 @@ impl Repo {
             },
         }
     }
-}
-
-#[derive(Deserialize)]
-struct Branch {
-    commit: BranchCommit,
-}
-
-#[derive(Deserialize)]
-struct BranchCommit {
-    id: String,
 }
 
 /// The `page` query parameter of a URL.
@@ -155,11 +159,11 @@ impl Lister for Forgejo {
     }
 
     async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let lookups: Vec<_> = repos.iter().map(|r| self.head(r)).collect();
-        stream::iter(lookups)
-            .buffered(HEAD_CONCURRENCY)
-            .try_collect()
-            .await
+        let remotes = repos
+            .iter()
+            .map(|r| self.remote(&r.snapshot))
+            .collect::<Result<Vec<_>, _>>()?;
+        git::heads(FORGE, remotes, &self.git).await
     }
 
     /// `GET /repositories/{id}`: by id, so a rename or a transfer is followed rather than
@@ -177,28 +181,20 @@ impl Lister for Forgejo {
 }
 
 impl Forgejo {
-    async fn head(&self, r: &Listed) -> Result<Option<String>, ForgeError> {
-        let s = &r.snapshot;
-        let Some(branch) = s.default_branch.as_deref().filter(|_| !s.empty) else {
+    /// `{base}/{owner}/{repo}.git`, built from the configured base, never from a URL the forge
+    /// sent: the credential only ever goes to the host the connection names.
+    fn remote(&self, s: &RepoSnapshot) -> Result<Option<git::Remote>, ForgeError> {
+        let Some(branch) = readable_branch(s) else {
             return Ok(None);
         };
-        let (owner, name) = r.snapshot.locator.split_once('/').ok_or_else(|| {
-            ForgeError::protocol(FORGE, format!("full name {:?}", r.snapshot.locator))
-        })?;
-        let url = format!(
-            "{}/repos/{}/{}/branches/{}",
-            self.api,
-            escape_segment(owner),
-            escape_segment(name),
-            escape_path(branch)
-        );
-        match self.http.get_json::<Branch>(&url).await {
-            Ok((_, Some(b))) => commit_id(FORGE, &b.commit.id).map(Some),
-            Ok((_, None)) => Ok(None),
-            // Listed as non-empty, yet the default branch is gone: no HEAD to record.
-            Err(e) if e.class() == Some(Class::NotFound) => Ok(None),
-            Err(e) => Err(e),
-        }
+        let (owner, name) = s
+            .full_name
+            .split_once('/')
+            .ok_or_else(|| ForgeError::protocol(FORGE, format!("full name {:?}", s.full_name)))?;
+        Ok(Some(git::Remote {
+            url: git::remote_url(&self.base, &[owner, &format!("{name}.git")])?,
+            branch: branch.to_string(),
+        }))
     }
 }
 
@@ -312,34 +308,31 @@ mod tests {
         assert!(forgejo(t).page(None).await.is_err());
     }
 
-    #[tokio::test]
-    async fn heads_skip_empty_repositories() {
-        let sha = "b8a1a303d868e0bc2ed18bc8a39aaeb6fe8c5147";
-        let t = ScriptedTransport::new(move |req| {
-            assert!(req.uri().path().ends_with("/repos/acme/a/branches/main"));
-            ScriptedTransport::reply(200, serde_json::json!({"commit": {"id": sha}}).to_string())
-        });
-        let f = forgejo(t.clone());
-        let listed: Vec<Listed> = ["a", "b"]
-            .iter()
-            .enumerate()
-            .map(|(i, n)| Listed {
-                snapshot: RepoSnapshot {
-                    external_id: i.to_string(),
-                    full_name: format!("acme/{n}"),
-                    name: n.to_string(),
-                    default_branch: Some("main".into()),
-                    archived: false,
-                    topics: Some(vec![]),
-                    locator: format!("acme/{n}"),
-                    empty: *n == "b",
-                    web_url: None,
-                },
-            })
-            .collect();
-        let heads = f.heads(&listed).await.unwrap();
-        assert_eq!(heads, vec![Some(sha.to_string()), None]);
-        assert_eq!(t.seen().len(), 1);
+    #[test]
+    fn remotes_are_built_from_the_configured_base() {
+        let f = forgejo(ScriptedTransport::new(|_| {
+            ScriptedTransport::reply(200, "[]")
+        }));
+        let mut s = Repo {
+            id: 1,
+            full_name: "acme/my repo".into(),
+            name: "my repo".into(),
+            default_branch: Some("main".into()),
+            archived: false,
+            empty: false,
+            topics: None,
+            html_url: Some("http://evil.example/acme/my-repo".into()),
+        }
+        .into_listed()
+        .snapshot;
+        let r = f.remote(&s).unwrap().unwrap();
+        assert_eq!(r.url.as_str(), "http://f/acme/my%20repo.git");
+        assert_eq!(r.branch, "main");
+        s.empty = true;
+        assert!(
+            f.remote(&s).unwrap().is_none(),
+            "an empty repository costs no request"
+        );
     }
 
     #[tokio::test]

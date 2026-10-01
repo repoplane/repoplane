@@ -1,21 +1,17 @@
 //! GitHub and GitHub Enterprise Server: `GET /orgs/{org}/repos`, pages followed by their `Link`
-//! header, topics included with each repository. HEADs come from GraphQL, 25 aliased
-//! `repository` lookups per query and a page's queries in flight together, rather than one REST
-//! call per repository: four points of the GraphQL budget per page of 100, not 100 of the REST
-//! one.
+//! header, topics included with each repository. HEADs are read over git (`ls-remote`), which
+//! the REST and GraphQL budgets do not count: GraphQL's CPU-time limit would cap them near 600 a
+//! minute whatever the concurrency.
 //!
-//! GitHub signals a rate limit in three ways, none of them a plain 429: a 403 with
-//! `X-RateLimit-Remaining: 0`, a 403 or 429 whose body names a "secondary rate limit", and a
-//! GraphQL 200 whose `errors` say `RATE_LIMITED`. `classify` reads all three, so the shared
-//! `HttpClient` waits them out like any other.
+//! GitHub signals a rate limit in two ways, neither of them a plain 429: a 403 with
+//! `X-RateLimit-Remaining: 0`, and a 403 or 429 whose body names a "secondary rate limit".
+//! `classify` reads both, so the shared `HttpClient` waits them out like any other.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::{self, StreamExt, TryStreamExt};
 use http::{HeaderMap, Response};
 use repoplane_proto::ForgeKind;
 use repoplane_proto::inventory::RepoSnapshot;
@@ -23,26 +19,24 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Class, ForgeError};
+use crate::git::{self, GitAuth};
 use crate::http::{HttpClient, Transport, Verdict, classify_generic, header, retry_after};
-use crate::{Listed, Lister, Page, Token, commit_id, escape_segment, link, numeric_id, within};
+use crate::{
+    Listed, Lister, Page, Token, escape_segment, link, numeric_id, readable_branch, within,
+};
 
 const FORGE: &str = "github";
 const PAGE_SIZE: u32 = 100;
-/// Repositories per GraphQL query. Resolving `defaultBranchRef` costs GitHub about 0.1s per
-/// repository, done one after another within a query, and a query is cut off at 10s with a 502:
-/// measured on github.com, 100 per query failed every time, 50 took 6s, 25 about 3s.
-const HEAD_BATCH: usize = 25;
-/// Queries in flight at once, so a page of 100 takes the time of one query of 25. GitHub asks
-/// for restraint in concurrency, not for none.
-const HEAD_QUERIES: usize = 4;
 /// The pause for a secondary rate limit or a bare 429, which say nothing of their own.
 const SECONDARY_WAIT: Duration = Duration::from_secs(60);
 
 pub struct Github {
     http: HttpClient,
     api: String,
-    graphql: String,
+    /// Where git reaches repositories: https://github.com, or the Enterprise Server's own host.
+    git_base: String,
     org: String,
+    git: GitAuth,
 }
 
 impl Github {
@@ -53,7 +47,7 @@ impl Github {
         transport: Arc<dyn Transport>,
         cancel: CancellationToken,
     ) -> Result<Self, ForgeError> {
-        let (api, graphql) = endpoints(base_url)?;
+        let (api, git_base) = endpoints(base_url)?;
         let mut headers = HeaderMap::new();
         let (k, v) = header("authorization", &format!("Bearer {}", token.expose()))?;
         headers.insert(k, v);
@@ -62,16 +56,20 @@ impl Github {
         let (k, v) = header("x-github-api-version", "2022-11-28")?;
         headers.insert(k, v);
         Ok(Github {
-            http: HttpClient::new(FORGE, transport, classify, headers, token, cancel),
+            http: HttpClient::new(FORGE, transport, classify, headers, token.clone(), cancel),
             api,
-            graphql,
+            git_base,
             org: org.to_string(),
+            git: GitAuth {
+                username: "x-access-token",
+                token,
+            },
         })
     }
 }
 
-/// The REST and GraphQL roots for what the user configured. github.com serves its API from a
-/// host of its own; GitHub Enterprise Server serves both under the instance's `/api`.
+/// The REST root and the git root for what the user configured. github.com serves its API from
+/// a host of its own; GitHub Enterprise Server serves the API under the instance's `/api`.
 fn endpoints(base_url: &str) -> Result<(String, String), ForgeError> {
     let base = base_url.trim().trim_end_matches('/');
     let u = url::Url::parse(base)
@@ -82,12 +80,9 @@ fn endpoints(base_url: &str) -> Result<(String, String), ForgeError> {
         "github.com" | "www.github.com" | "api.github.com"
     ) && u.path().trim_matches('/').is_empty()
     {
-        return Ok((
-            "https://api.github.com".into(),
-            "https://api.github.com/graphql".into(),
-        ));
+        return Ok(("https://api.github.com".into(), "https://github.com".into()));
     }
-    Ok((format!("{base}/api/v3"), format!("{base}/api/graphql")))
+    Ok((format!("{base}/api/v3"), base.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -190,15 +185,11 @@ impl Lister for Github {
     }
 
     async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let queries: Vec<_> = repos
-            .chunks(HEAD_BATCH)
-            .map(|c| self.head_batch(c))
-            .collect();
-        let batches: Vec<Vec<Option<String>>> = stream::iter(queries)
-            .buffered(HEAD_QUERIES)
-            .try_collect()
-            .await?;
-        Ok(batches.into_iter().flatten().collect())
+        let remotes = repos
+            .iter()
+            .map(|r| self.remote(&r.snapshot))
+            .collect::<Result<Vec<_>, _>>()?;
+        git::heads(FORGE, remotes, &self.git).await
     }
 
     /// `GET /repositories/{id}`: by id, so a rename or a transfer is followed rather than
@@ -215,149 +206,32 @@ impl Lister for Github {
     }
 }
 
-#[derive(Deserialize)]
-struct GraphqlAnswer {
-    #[serde(default)]
-    data: Option<HashMap<String, Option<RepoHead>>>,
-    #[serde(default)]
-    errors: Vec<GraphqlError>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RepoHead {
-    default_branch_ref: Option<BranchRef>,
-}
-
-#[derive(Deserialize)]
-struct BranchRef {
-    target: Option<Target>,
-}
-
-#[derive(Deserialize)]
-struct Target {
-    oid: String,
-}
-
-#[derive(Deserialize)]
-struct GraphqlError {
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
-    #[serde(default)]
-    message: String,
-    /// The first element is the alias the error belongs to; the rest is inside it.
-    #[serde(default)]
-    path: Vec<serde_json::Value>,
-}
-
 impl Github {
-    /// One GraphQL query for up to `HEAD_BATCH` repositories, each under the alias `rN` and
-    /// named through variables, so no repository name is ever spliced into the query text.
-    async fn head_batch(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        if repos.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut params = Vec::with_capacity(repos.len());
-        let mut fields = String::new();
-        let mut vars = serde_json::Map::new();
-        for (i, r) in repos.iter().enumerate() {
-            let (owner, name) = r.snapshot.locator.split_once('/').ok_or_else(|| {
-                ForgeError::protocol(FORGE, format!("full name {:?}", r.snapshot.locator))
-            })?;
-            params.push(format!("$o{i}: String!, $n{i}: String!"));
-            fields.push_str(&format!(
-                " r{i}: repository(owner: $o{i}, name: $n{i}) {{ defaultBranchRef {{ target {{ oid }} }} }}"
-            ));
-            vars.insert(format!("o{i}"), owner.into());
-            vars.insert(format!("n{i}"), name.into());
-        }
-        let query = format!("query Heads({}) {{{fields} }}", params.join(", "));
-        let body = serde_json::json!({ "query": query, "variables": vars });
-        let answer = self.http.post_query(&self.graphql, &body).await?;
-        let parsed: GraphqlAnswer = self
-            .http
-            .decode(&self.graphql, &answer)?
-            .ok_or_else(|| ForgeError::protocol(FORGE, "GraphQL answered with an empty body"))?;
-        read_heads(repos.len(), parsed)
+    /// `{git base}/{owner}/{repo}.git`, built from the configured base, never from a URL the
+    /// forge sent: the credential only ever goes to the host the connection names.
+    fn remote(&self, s: &RepoSnapshot) -> Result<Option<git::Remote>, ForgeError> {
+        let Some(branch) = readable_branch(s) else {
+            return Ok(None);
+        };
+        let (owner, name) = s
+            .full_name
+            .split_once('/')
+            .ok_or_else(|| ForgeError::protocol(FORGE, format!("full name {:?}", s.full_name)))?;
+        Ok(Some(git::Remote {
+            url: git::remote_url(&self.git_base, &[owner, &format!("{name}.git")])?,
+            branch: branch.to_string(),
+        }))
     }
-}
-
-/// The HEADs in the query's order. GraphQL reports trouble in `errors` beside whatever `data` it
-/// could still produce, so an error only fails the batch when it touches a repository asked for:
-/// a `NOT_FOUND` one (deleted or renamed since the listing) is just a repository without a HEAD,
-/// and an error elsewhere is logged and the data used.
-fn read_heads(n: usize, a: GraphqlAnswer) -> Result<Vec<Option<String>>, ForgeError> {
-    let mut data = a.data.unwrap_or_default();
-    let mut gone = vec![false; n];
-    for e in &a.errors {
-        let alias = e.path.first().and_then(|p| p.as_str());
-        let index = alias
-            .and_then(|p| p.strip_prefix('r'))
-            .and_then(|i| i.parse::<usize>().ok());
-        match index {
-            Some(i) if i < n && e.kind.as_deref() == Some("NOT_FOUND") && e.path.len() == 1 => {
-                gone[i] = true
-            }
-            Some(i) if i < n => {
-                return Err(ForgeError::protocol(
-                    FORGE,
-                    format!(
-                        "GraphQL error on repository {i}: {} {}",
-                        e.kind.as_deref().unwrap_or(""),
-                        e.message
-                    ),
-                ));
-            }
-            _ if data.is_empty() => {
-                return Err(ForgeError::protocol(
-                    FORGE,
-                    format!(
-                        "GraphQL error: {} {}",
-                        e.kind.as_deref().unwrap_or(""),
-                        e.message
-                    ),
-                ));
-            }
-            _ => tracing::warn!(
-                forge = FORGE,
-                kind = e.kind.as_deref().unwrap_or(""),
-                "GraphQL error outside the repositories asked for: {}",
-                e.message
-            ),
-        }
-    }
-    (0..n)
-        .map(|i| match data.remove(&format!("r{i}")) {
-            Some(Some(repo)) => match repo.default_branch_ref.and_then(|b| b.target) {
-                Some(t) => commit_id(FORGE, &t.oid).map(Some),
-                // No default branch: the repository has no commits.
-                None => Ok(None),
-            },
-            Some(None) if gone[i] => Ok(None),
-            Some(None) => Err(ForgeError::protocol(
-                FORGE,
-                format!("GraphQL answered null for repository {i} without saying why"),
-            )),
-            None => Err(ForgeError::protocol(
-                FORGE,
-                format!("GraphQL answer lacks repository {i}"),
-            )),
-        })
-        .collect()
 }
 
 /// GitHub's reading of an answer. On a 403 or 429, in the order GitHub documents: `Retry-After`,
 /// then an exhausted primary budget (`X-RateLimit-Remaining: 0`, wait until
 /// `X-RateLimit-Reset`), then a secondary limit named in the body. Any other 403 is a missing
-/// permission, not worth a retry. A 200 carrying a GraphQL `RATE_LIMITED` error is a rate limit
-/// too.
+/// permission, not worth a retry.
 pub fn classify(resp: &Response<Bytes>) -> Option<Verdict> {
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
-        return graphql_rate_limited(resp.body()).then(|| Verdict {
-            class: Class::RateLimited,
-            retry_after: retry_after(resp).or_else(|| until_reset(resp)),
-        });
+        return None;
     }
     if status != 403 && status != 429 {
         return classify_generic(resp);
@@ -405,34 +279,10 @@ fn until_reset(resp: &Response<Bytes>) -> Option<Duration> {
     Some(Duration::from_secs(reset.saturating_sub(now) + 1))
 }
 
-/// Whether a 2xx body is a GraphQL answer refused for its rate limit. The substring test keeps
-/// every REST page from being parsed twice.
-fn graphql_rate_limited(body: &[u8]) -> bool {
-    #[derive(Deserialize)]
-    struct Errors {
-        #[serde(default)]
-        errors: Vec<GraphqlError>,
-    }
-    if !body.windows(12).any(|w| w == b"RATE_LIMITED") {
-        return false;
-    }
-    serde_json::from_slice::<Errors>(body)
-        .map(|e| {
-            e.errors
-                .iter()
-                .any(|e| e.kind.as_deref() == Some("RATE_LIMITED"))
-        })
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::http::ScriptedTransport;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    const SHA: &str = "b8a1a303d868e0bc2ed18bc8a39aaeb6fe8c5147";
 
     fn repo(id: i64, name: &str) -> serde_json::Value {
         serde_json::json!({
@@ -454,41 +304,31 @@ mod tests {
         .unwrap()
     }
 
-    fn listed(names: &[&str]) -> Vec<Listed> {
-        names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| Listed {
-                snapshot: RepoSnapshot {
-                    external_id: i.to_string(),
-                    full_name: format!("acme/{n}"),
-                    name: n.to_string(),
-                    default_branch: Some("main".into()),
-                    archived: false,
-                    topics: Some(vec![]),
-                    locator: format!("acme/{n}"),
-                    empty: false,
-                    web_url: None,
-                },
-            })
-            .collect()
-    }
-
     #[test]
     fn endpoints_for_github_com_and_enterprise() {
         let api = |b| endpoints(b).unwrap();
-        assert_eq!(api("https://github.com").0, "https://api.github.com");
         assert_eq!(
-            api("https://github.com/").1,
-            "https://api.github.com/graphql"
+            api("https://github.com/"),
+            ("https://api.github.com".into(), "https://github.com".into())
         );
         assert_eq!(
             api("https://ghe.corp.example/"),
             (
                 "https://ghe.corp.example/api/v3".into(),
-                "https://ghe.corp.example/api/graphql".into()
+                "https://ghe.corp.example".into()
             )
         );
+    }
+
+    #[test]
+    fn remotes_are_built_from_the_configured_base() {
+        let g = github(ScriptedTransport::new(|_| {
+            ScriptedTransport::reply(200, "[]")
+        }));
+        let s: Repo = serde_json::from_value(repo(1, "billing-api")).unwrap();
+        let r = g.remote(&s.into_listed().snapshot).unwrap().unwrap();
+        assert_eq!(r.url.as_str(), "https://github.com/acme/billing-api.git");
+        assert_eq!(r.branch, "main");
     }
 
     #[tokio::test]
@@ -572,126 +412,6 @@ mod tests {
         assert!(r(None, 0).looks_empty());
         assert!(!r(Some("2026-09-27T16:37:20Z"), 0).looks_empty());
         assert!(!r(Some("2026-09-27T16:37:04Z"), 12).looks_empty());
-    }
-
-    #[tokio::test]
-    async fn heads_are_an_aliased_graphql_query() {
-        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
-        let b2 = bodies.clone();
-        let t = ScriptedTransport::new(move |req| {
-            b2.lock()
-                .unwrap()
-                .push(serde_json::from_slice(req.body()).unwrap());
-            ScriptedTransport::reply(
-                200,
-                serde_json::json!({"data": {
-                    "r0": {"defaultBranchRef": {"target": {"oid": SHA}}},
-                    "r1": {"defaultBranchRef": null},
-                    "r2": {"defaultBranchRef": {"target": {"oid": SHA.to_uppercase()}}}
-                }})
-                .to_string(),
-            )
-        });
-        let g = github(t.clone());
-        let heads = g.heads(&listed(&["a", "no-commits", "c"])).await.unwrap();
-        assert_eq!(
-            heads,
-            vec![Some(SHA.to_string()), None, Some(SHA.to_string())]
-        );
-        assert_eq!(t.seen(), vec!["POST /graphql"]);
-        let body = &bodies.lock().unwrap()[0];
-        let q = body["query"].as_str().unwrap();
-        assert!(q.contains("r1: repository(owner: $o1, name: $n1)"), "{q}");
-        assert!(q.contains("$o2: String!, $n2: String!"), "{q}");
-        assert!(!q.contains("no-commits"), "names travel as variables: {q}");
-        assert_eq!(body["variables"]["o1"], "acme");
-        assert_eq!(body["variables"]["n1"], "no-commits");
-    }
-
-    #[tokio::test]
-    async fn heads_batch_by_twenty_five_in_order() {
-        // Each repository's HEAD is its own number, so any mix-up across batches shows.
-        let t = ScriptedTransport::new(|req| {
-            let body: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
-            let vars = body["variables"].as_object().unwrap();
-            let data: serde_json::Map<_, _> = (0..vars.len() / 2)
-                .map(|i| {
-                    let n: u64 = vars[&format!("n{i}")].as_str().unwrap()[4..]
-                        .parse()
-                        .unwrap();
-                    let oid = format!("{n:040x}");
-                    (
-                        format!("r{i}"),
-                        serde_json::json!({"defaultBranchRef": {"target": {"oid": oid}}}),
-                    )
-                })
-                .collect();
-            ScriptedTransport::reply(200, serde_json::json!({ "data": data }).to_string())
-        });
-        let names: Vec<String> = (0..60).map(|i| format!("repo{i}")).collect();
-        let names: Vec<&str> = names.iter().map(String::as_str).collect();
-        let heads = github(t.clone()).heads(&listed(&names)).await.unwrap();
-        let want: Vec<_> = (0..60u64).map(|n| Some(format!("{n:040x}"))).collect();
-        assert_eq!(heads, want);
-        assert_eq!(t.seen(), vec!["POST /graphql"; 3]);
-    }
-
-    #[test]
-    fn graphql_errors_fail_only_the_repositories_they_touch() {
-        let parse = |v: serde_json::Value| serde_json::from_value::<GraphqlAnswer>(v).unwrap();
-        // Deleted since the listing: no HEAD, not a failure.
-        let gone = parse(serde_json::json!({
-            "data": {"r0": null, "r1": {"defaultBranchRef": {"target": {"oid": SHA}}}},
-            "errors": [{"type": "NOT_FOUND", "path": ["r0"], "message": "Could not resolve"}]
-        }));
-        assert_eq!(
-            read_heads(2, gone).unwrap(),
-            vec![None, Some(SHA.to_string())]
-        );
-        // Refused for a repository asked for: fail rather than record a wrong None.
-        let refused = parse(serde_json::json!({
-            "data": {"r0": null},
-            "errors": [{"type": "FORBIDDEN", "path": ["r0"], "message": "SAML enforcement"}]
-        }));
-        assert!(read_heads(1, refused).is_err());
-        // An error that names no repository, beside complete data: use the data.
-        let aside = parse(serde_json::json!({
-            "data": {"r0": {"defaultBranchRef": null}},
-            "errors": [{"type": "SOMETHING", "message": "unrelated"}]
-        }));
-        assert_eq!(read_heads(1, aside).unwrap(), vec![None]);
-        // No data at all.
-        let none = parse(serde_json::json!({"errors": [{"message": "parse error"}]}));
-        assert!(read_heads(1, none).is_err());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn graphql_rate_limited_is_waited_out() {
-        let n = Arc::new(AtomicUsize::new(0));
-        let n2 = n.clone();
-        let t = ScriptedTransport::new(move |_| {
-            if n2.fetch_add(1, Ordering::SeqCst) == 0 {
-                ScriptedTransport::reply_with(
-                    200,
-                    r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
-                    &[("retry-after", "5")],
-                )
-            } else {
-                ScriptedTransport::reply(200, serde_json::json!({"data": {"r0": {"defaultBranchRef": {"target": {"oid": SHA}}}}}).to_string())
-            }
-        });
-        let heads = github(t.clone()).heads(&listed(&["a"])).await.unwrap();
-        assert_eq!(heads, vec![Some(SHA.to_string())]);
-        assert_eq!(n.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn graphql_rate_limited_is_a_rate_limit() {
-        let r =
-            ScriptedTransport::reply(200, r#"{"errors":[{"type":"RATE_LIMITED","message":"x"}]}"#);
-        assert_eq!(classify(&r).map(|v| v.class), Some(Class::RateLimited));
-        let fine = ScriptedTransport::reply(200, r#"[{"name":"RATE_LIMITED"}]"#);
-        assert_eq!(classify(&fine), None);
     }
 
     #[test]

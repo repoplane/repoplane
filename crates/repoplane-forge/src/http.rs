@@ -273,16 +273,6 @@ impl HttpClient {
         self.send(Method::GET, url, None).await
     }
 
-    /// A POST that reads rather than writes (GraphQL queries): safe to repeat.
-    pub async fn post_query(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<Answer, ForgeError> {
-        let raw = Bytes::from(serde_json::to_vec(body).expect("a JSON value encodes"));
-        self.send(Method::POST, url, Some(raw)).await
-    }
-
     /// Decodes an answer; an empty or `null` body is `None`.
     pub fn decode<T: DeserializeOwned>(
         &self,

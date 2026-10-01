@@ -110,7 +110,7 @@ current code, so a change that would strand runs in flight fails `make unit`.
 Three forge activities, thin wrappers over `repoplane-forge`:
 - `list_page`: one page of the organisation.
 - `lookup`: the given ids that still exist in the organisation.
-- `read_heads`: default-branch HEADs, each naming its branch.
+- `read_heads`: default-branch HEADs, each naming its branch, read with `git ls-remote` (below).
 
 A forge error becomes a retryable activity failure when the forge was busy or unreachable, and a
 non-retryable one otherwise. `concurrency` bounds the activities run at once.
@@ -133,12 +133,12 @@ because each forge signals a limit differently. The client also scrubs the token
 error. The ideas come from forgelab, but the code is written independently: forgelab's own
 design requires the harness to be *independently wrong* from the system it tests.
 
-| | Listing | Topics | Archived | Default-branch HEAD |
+| | Listing | Topics | Archived | git remote for HEADs |
 |---|---|---|---|---|
-| **Forgejo** | `GET /orgs/{org}/repos`, 50 per page (the server clamps); only the page *number* is taken from `Link`, because Forgejo writes it from its own `ROOT_URL` | in the payload | `archived` | one `branches/{b}` per repository |
-| **GitHub** | `GET /orgs/{org}/repos`, 100 per page, `Link` rel=next only | in the payload | `archived` | GraphQL, 25 aliased lookups per query, 4 queries in flight (100 per query times out) |
-| **GitLab** | `GET /groups/{path}/projects?include_subgroups=true`, 100 per page; offset, because keyset is silently ignored on this endpoint | in the payload | `archived`; projects pending deletion excluded | one `repository/branches/{b}` per project, with the branch as a single `%2F`-escaped segment |
-| **Azure DevOps** | `GET {org}/_apis/git/repositories`: every project, disabled repositories included, in one answer | **none**: `topics` is `null`, and `--topic` on such a connection is refused | `isDisabled`, whose HEAD cannot be read | one `refs?filter=heads/{b}` per repository, exact name picked |
+| **Forgejo** | `GET /orgs/{org}/repos`, 50 per page (the server clamps); only the page *number* is taken from `Link`, because Forgejo writes it from its own `ROOT_URL` | in the payload | `archived` | `{base}/{owner}/{repo}.git` |
+| **GitHub** | `GET /orgs/{org}/repos`, 100 per page, `Link` rel=next only | in the payload | `archived` | `https://github.com/{owner}/{repo}.git` (or the Enterprise host), user `x-access-token` |
+| **GitLab** | `GET /groups/{path}/projects?include_subgroups=true`, 100 per page; offset, because keyset is silently ignored on this endpoint | in the payload | `archived`; projects pending deletion excluded | `{base}/{group}/…/{project}.git`, user `oauth2` |
+| **Azure DevOps** | `GET {org}/_apis/git/repositories`: every project, disabled repositories included, in one answer | **none**: `topics` is `null`, and `--topic` on such a connection is refused | `isDisabled`, whose HEAD cannot be read (never asked) | `{base}/{org}/{project}/_git/{repo}` |
 
 Reconcile and head refresh are separate operations
 ([ADR 0011](adr/0011-inventory-and-heads-are-separate.md)). A reconcile records what exists and
@@ -147,6 +147,27 @@ HEAD, because that HEAD described another branch. A head refresh reads the HEADs
 repositories it was given, and stamps each with `head_observed_at`. The HEAD column above is
 therefore the cost of a refresh, paid only for its targets. An empty repository records
 `head: null` (`—` in the CLI); that is a fact about the repository, not a failed read.
+
+**HEADs are read over git, not over the API.** One `git ls-remote <remote> refs/heads/<branch>`
+per repository, up to 32 at once. Git traffic is not counted against the REST and GraphQL
+budgets, which is what made API-read HEADs expensive:
+- GitHub limits GraphQL to 60 s of CPU time per minute, which caps HEADs read that way near 600 a
+  minute, whatever the concurrency.
+- gitlab.com's Free plan allows 100 API requests a minute.
+- Azure DevOps meters load per user.
+
+How the remote is built:
+- From the connection's configured base, never from a URL the forge sent, so the token only
+  ever goes to the host the connection names.
+- The token travels as an `Authorization` header scoped to that origin through `GIT_CONFIG_*`,
+  never in the URL or on the command line.
+- git runs with a clean environment: no global or system config, no prompts; only proxy and CA
+  variables pass through.
+- Empty and disabled repositories cost no call.
+
+Measured on the sandboxes (about 125 repos each), a full refresh took 3.4 s on GitHub, 7.7 s on
+GitLab and 1.2 s on Azure DevOps, against 7.2 s, 11.0 s and 1.6 s through the APIs before. The
+worker needs `git` on its `PATH`.
 
 ## Crates and the boundaries between them
 

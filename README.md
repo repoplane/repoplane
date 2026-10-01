@@ -57,7 +57,7 @@ audit every line that touches their code and their credentials:
 |---|---|
 | `repoplane` | the CLI: a client of the API, and nothing else |
 | `repoplane-api` | owns Postgres, serves `/v1`, and runs the workflows and their Postgres steps as a Temporal worker; never calls a forge |
-| `repoplane-worker` | runs the forge steps as a Temporal worker on its queue; holds the forge tokens; talks only to Temporal and forges; never opens a database |
+| `repoplane-worker` | runs the forge steps as a Temporal worker on its queue; holds the forge tokens; talks only to Temporal and forges (API and `git`, which it needs on its `PATH`); never opens a database |
 
 A reconcile and a head refresh are each a Temporal workflow. They retry with backoff, survive a
 process dying, and leave room for what comes next: waiting days for a merge, waves, signals.

@@ -10,6 +10,7 @@
 pub mod azuredevops;
 pub mod error;
 pub mod forgejo;
+pub mod git;
 pub mod github;
 pub mod gitlab;
 pub mod http;
@@ -130,8 +131,16 @@ pub fn lister_with_token(
     })
 }
 
-/// How many HEAD lookups an adapter without a batch endpoint keeps in flight.
+/// How many lookups by id an adapter keeps in flight.
 pub const HEAD_CONCURRENCY: usize = 8;
+
+/// The branch whose tip is a repository's HEAD, if there is one to read: an empty repository,
+/// or one with no default branch, has none, and costs no request.
+pub(crate) fn readable_branch(s: &RepoSnapshot) -> Option<&str> {
+    s.default_branch
+        .as_deref()
+        .filter(|b| !b.is_empty() && !s.empty)
+}
 
 /// Percent-encodes one path segment.
 pub fn escape_segment(s: &str) -> String {
