@@ -157,14 +157,12 @@ impl Lister for AzureDevops {
         Ok(Page {
             repos: repos.into_iter().map(|r| self.listed(r)).collect(),
             next: None,
+            rest: None,
         })
     }
 
-    async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let remotes = repos
-            .iter()
-            .map(|r| self.remote(&r.snapshot))
-            .collect::<Result<Vec<_>, _>>()?;
+    async fn heads(&self, repos: &[Listed]) -> Vec<Result<Option<String>, ForgeError>> {
+        let remotes = repos.iter().map(|r| self.remote(&r.snapshot)).collect();
         git::heads(FORGE, remotes, &self.git).await
     }
 

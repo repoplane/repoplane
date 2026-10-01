@@ -439,6 +439,7 @@ async fn shifting_listing(s: &Suite) -> anyhow::Result<()> {
     );
 
     proxy.arm();
+    let log_mark = s.stack.worker_log_len();
     let r = s.stack.reconcile(conn).await;
     let outcome = async {
         let r = r?;
@@ -448,11 +449,9 @@ async fn shifting_listing(s: &Suite) -> anyhow::Result<()> {
             .unwrap()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("the proxy never shifted the listing"))?;
-        let still_there: usize = s
-            .stack
-            .worker_log_field("did not return", "still_there")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let still_there =
+            s.stack
+                .worker_log_count_since(log_mark, "did not return", "still_there=true");
         // The victim sat on page 1, already read: this run saw it. What it did not see is the
         // repository the shift pushed from page 2 onto page 1, which still exists.
         anyhow::ensure!(

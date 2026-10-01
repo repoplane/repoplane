@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use base64::Engine as _;
-use futures::stream::{self, StreamExt, TryStreamExt};
+use futures::stream::{self, StreamExt};
 use tokio::process::Command;
 
 use crate::error::{Class, ForgeError};
@@ -41,17 +41,10 @@ const PASSTHROUGH: &[&str] = &[
 /// One `ls-remote` may take this long before it counts as a transient failure.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
-/// git processes run at once by one `heads` call. Each `ls-remote` is a process and a TLS
-/// handshake, so it takes more of them in flight than API calls to go as fast; none of them
-/// spends API budget. Measured on ~125-repository sandboxes (one refresh, 2026-10-01):
-///
-/// | in flight | GitHub | GitLab | Azure DevOps |
-/// |---|---|---|---|
-/// | API (REST/GraphQL), 8 | 7.2 s | 11.0 s | 1.6 s |
-/// | git, 8 | 10.1 s | 16.5 s | 3.7 s |
-/// | git, 32 | 3.4 s | 7.7 s | 1.2 s |
-/// | git, 64 | 4.4 s | 4.9 s | 0.9 s |
-pub const CONCURRENCY: usize = 32;
+/// git processes run at once by one `heads` call over several repositories (the `list`
+/// example). The worker reads one repository per activity, so there it is the worker's
+/// activity slots that bound git, not this.
+pub const CONCURRENCY: usize = 8;
 
 /// How git authenticates to a forge: Basic, with the token as the password under the username
 /// the forge expects.
@@ -199,26 +192,25 @@ fn origin(url: &url::Url) -> String {
     o
 }
 
-/// The HEAD of each remote, in order, `None` where there is nothing to read; at most
-/// [`CONCURRENCY`] git processes at once.
+/// The HEAD of each remote, in order, each with its own outcome: `Ok(None)` where there is
+/// nothing to read, an error where git could not tell. At most [`CONCURRENCY`] git processes at
+/// once.
 pub async fn heads(
     forge: &'static str,
-    remotes: Vec<Option<Remote>>,
+    remotes: Vec<Result<Option<Remote>, ForgeError>>,
     auth: &GitAuth,
-) -> Result<Vec<Option<String>>, ForgeError> {
+) -> Vec<Result<Option<String>, ForgeError>> {
     let lookups: Vec<_> = remotes
-        .iter()
+        .into_iter()
         .map(|r| async move {
             match r {
-                Some(r) => ls_remote(forge, r, Some(auth)).await,
-                None => Ok(None),
+                Ok(Some(r)) => ls_remote(forge, &r, Some(auth)).await,
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
             }
         })
         .collect();
-    stream::iter(lookups)
-        .buffered(CONCURRENCY)
-        .try_collect()
-        .await
+    stream::iter(lookups).buffered(CONCURRENCY).collect().await
 }
 
 /// The forge's base URL with path segments appended, each escaped: a repository called

@@ -152,17 +152,21 @@ impl Lister for Forgejo {
         };
         // An empty page ends the listing whatever the header says.
         let next = if repos.is_empty() { None } else { next };
+        // The first page's `last` link says how many pages there are; only its number is used.
+        let rest = (page == 1 && next.is_some())
+            .then(|| link::last(answer.header("link")).and_then(|l| link::page_of(&l)))
+            .flatten()
+            .filter(|n| *n <= link::MAX_PAGES)
+            .map(|n| (2..=n).map(|k| k.to_string()).collect());
         Ok(Page {
             repos: repos.into_iter().map(Repo::into_listed).collect(),
             next,
+            rest,
         })
     }
 
-    async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let remotes = repos
-            .iter()
-            .map(|r| self.remote(&r.snapshot))
-            .collect::<Result<Vec<_>, _>>()?;
+    async fn heads(&self, repos: &[Listed]) -> Vec<Result<Option<String>, ForgeError>> {
+        let remotes = repos.iter().map(|r| self.remote(&r.snapshot)).collect();
         git::heads(FORGE, remotes, &self.git).await
     }
 
@@ -357,5 +361,36 @@ mod tests {
         );
         assert!(f.get("9").await.unwrap().is_none(), "deleted");
         assert!(f.get("not-an-id").await.is_err());
+    }
+
+    /// The first page's `last` link names page 3: pages 2 and 3 can be fetched at once.
+    #[tokio::test]
+    async fn the_first_page_announces_the_rest() {
+        let t = ScriptedTransport::new(|req| {
+            if !req.uri().query().unwrap_or("").contains("page=1") {
+                return ScriptedTransport::reply(
+                    200,
+                    serde_json::json!([repo(2, "b", false)]).to_string(),
+                );
+            }
+            ScriptedTransport::reply_with(
+                200,
+                serde_json::json!([repo(1, "a", false)]).to_string(),
+                &[(
+                    "link",
+                    r#"<http://localhost:3000/api/v1/orgs/acme/repos?limit=50&page=2>; rel="next", <http://localhost:3000/api/v1/orgs/acme/repos?limit=50&page=3>; rel="last""#,
+                )],
+            )
+        });
+        let f = forgejo(t);
+        assert_eq!(
+            f.page(None).await.unwrap().rest,
+            Some(vec!["2".into(), "3".into()])
+        );
+        assert_eq!(
+            f.page(Some("2")).await.unwrap().rest,
+            None,
+            "only the first page announces"
+        );
     }
 }

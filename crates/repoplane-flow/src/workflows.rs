@@ -9,18 +9,19 @@ use std::time::Duration;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{ActivityOptions, WorkflowContext, WorkflowResult};
 use temporalio_workflow::common::error::{ActivityExecutionError, ApplicationFailure};
-use temporalio_workflow::{RetryPolicy, WorkflowTermination};
+use temporalio_workflow::{RetryPolicy, WorkflowTermination, join_all};
 
 use repoplane_proto::inventory::ConnectionSpec;
 
 use crate::activities::{
-    Control, Forge, ListPage, Lookup, ReadHeads, ReconcileFailed, RecordHeads, RecordPage,
+    Control, Forge, ListPage, Lookup, ReadHead, ReconcileFailed, RecordHeads, RecordPage,
     RefreshFailed,
 };
 use crate::{CONTROL_QUEUE, ReconcileInput, RefreshHeadsInput};
 
-/// Repositories looked up, or HEADs read, per forge activity.
-const BATCH: usize = 100;
+// No batch sizes and no waves: the workflow schedules every page, lookup and HEAD read at once,
+// and the worker's activity slots (`concurrency`) decide how many run at a time. Each is retried
+// on its own by the forge retry policy below.
 
 /// A forge call. Its HTTP layer already waits out rate limits for up to ten minutes per
 /// request, so an attempt may take that long; between attempts Temporal backs off. A failure the
@@ -123,40 +124,60 @@ async fn reconcile(
     let c = &input.connection;
     ctx.execute_activity(Control::start_reconcile, input.reconcile, control())
         .await?;
-    let mut cursor: Option<String> = None;
-    let mut cursors = BTreeSet::new();
-    loop {
-        let page = ctx
-            .execute_activity(
-                Forge::list_page,
-                ListPage {
-                    connection: c.clone(),
-                    cursor: cursor.clone(),
-                },
-                forge(c),
-            )
-            .await?;
-        if !page.repos.is_empty() {
-            ctx.execute_activity(
-                Control::record_page,
-                RecordPage {
-                    reconcile: input.reconcile,
-                    repos: page.repos,
-                },
-                control(),
-            )
-            .await?;
+    let first = ctx
+        .execute_activity(
+            Forge::list_page,
+            ListPage {
+                connection: c.clone(),
+                cursor: None,
+            },
+            forge(c),
+        )
+        .await?;
+    let (next, rest) = (first.next.clone(), first.rest.clone());
+    record(ctx, input, first.repos).await?;
+    match rest {
+        // The forge said how many pages there are: fetch them all at once, then record them one
+        // after another (pages recorded at once would contend for the same rows).
+        Some(cursors) => {
+            let pages = join_all(cursors.into_iter().map(|cursor| {
+                ctx.execute_activity(
+                    Forge::list_page,
+                    ListPage {
+                        connection: c.clone(),
+                        cursor: Some(cursor),
+                    },
+                    forge(c),
+                )
+            }))
+            .await;
+            for page in pages {
+                record(ctx, input, page?.repos).await?;
+            }
         }
-        match page.next {
-            None => break,
-            Some(next) => {
-                if !cursors.insert(next.clone()) {
+        // It did not: follow the listing one page at a time.
+        None => {
+            let mut cursor = next;
+            let mut cursors = BTreeSet::new();
+            while let Some(current) = cursor {
+                if !cursors.insert(current.clone()) {
                     return Err(Stop::Failed(format!(
                         "{}: the listing returned a page it had already returned",
                         c.forge
                     )));
                 }
-                cursor = Some(next);
+                let page = ctx
+                    .execute_activity(
+                        Forge::list_page,
+                        ListPage {
+                            connection: c.clone(),
+                            cursor: Some(current),
+                        },
+                        forge(c),
+                    )
+                    .await?;
+                cursor = page.next.clone();
+                record(ctx, input, page.repos).await?;
             }
         }
     }
@@ -166,31 +187,44 @@ async fn reconcile(
     let unseen = ctx
         .execute_activity(Control::unseen, input.reconcile, control())
         .await?;
-    for batch in unseen.chunks(BATCH) {
-        let still_there = ctx
-            .execute_activity(
-                Forge::lookup,
-                Lookup {
-                    connection: c.clone(),
-                    ids: batch.iter().map(|u| u.external_id.clone()).collect(),
-                },
-                forge(c),
-            )
-            .await?;
-        if !still_there.is_empty() {
-            ctx.execute_activity(
-                Control::record_page,
-                RecordPage {
-                    reconcile: input.reconcile,
-                    repos: still_there,
-                },
-                control(),
-            )
-            .await?;
-        }
+    let found = join_all(unseen.into_iter().map(|u| {
+        ctx.execute_activity(
+            Forge::lookup,
+            Lookup {
+                connection: c.clone(),
+                id: u.external_id,
+            },
+            forge(c),
+        )
+    }))
+    .await;
+    let mut still_there = Vec::new();
+    for f in found {
+        still_there.extend(f?);
     }
+    record(ctx, input, still_there).await?;
     ctx.execute_activity(Control::finish_reconcile, input.reconcile, control())
         .await?;
+    Ok(())
+}
+
+/// Records listed repositories, if there are any.
+async fn record(
+    ctx: &WorkflowContext<ReconcileWorkflow>,
+    input: &ReconcileInput,
+    repos: Vec<repoplane_proto::inventory::RepoSnapshot>,
+) -> Result<(), Stop> {
+    if !repos.is_empty() {
+        ctx.execute_activity(
+            Control::record_page,
+            RecordPage {
+                reconcile: input.reconcile,
+                repos,
+            },
+            control(),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -234,17 +268,19 @@ async fn refresh(
     let targets = ctx
         .execute_activity(Control::start_refresh, input.refresh, control())
         .await?;
-    for batch in targets.chunks(BATCH) {
-        let heads = ctx
-            .execute_activity(
-                Forge::read_heads,
-                ReadHeads {
-                    connection: c.clone(),
-                    targets: batch.to_vec(),
-                },
-                forge(c),
-            )
-            .await?;
+    let reads = join_all(targets.into_iter().map(|target| {
+        ctx.execute_activity(
+            Forge::read_head,
+            ReadHead {
+                connection: c.clone(),
+                target,
+            },
+            forge(c),
+        )
+    }))
+    .await;
+    let heads = reads.into_iter().collect::<Result<Vec<_>, _>>()?;
+    if !heads.is_empty() {
         ctx.execute_activity(
             Control::record_heads,
             RecordHeads {

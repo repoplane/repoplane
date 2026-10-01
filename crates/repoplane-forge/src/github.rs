@@ -174,6 +174,16 @@ impl Lister for Github {
                 format!("page {url} links to itself"),
             ));
         }
+        // On the first page, the `last` link says how many pages there are; their URLs are
+        // fetched at once. Each must stay under the API this connection names.
+        let rest = if cursor.is_none() {
+            link::rest_of(answer.header("link")).filter(|urls| {
+                urls.iter()
+                    .all(|u| u.starts_with(&format!("{}/", self.api)))
+            })
+        } else {
+            None
+        };
         Ok(Page {
             repos: repos
                 .unwrap_or_default()
@@ -181,14 +191,12 @@ impl Lister for Github {
                 .map(Repo::into_listed)
                 .collect(),
             next,
+            rest,
         })
     }
 
-    async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let remotes = repos
-            .iter()
-            .map(|r| self.remote(&r.snapshot))
-            .collect::<Result<Vec<_>, _>>()?;
+    async fn heads(&self, repos: &[Listed]) -> Vec<Result<Option<String>, ForgeError>> {
+        let remotes = repos.iter().map(|r| self.remote(&r.snapshot)).collect();
         git::heads(FORGE, remotes, &self.git).await
     }
 
@@ -508,5 +516,34 @@ mod tests {
         );
         assert!(g.get("9").await.unwrap().is_none(), "deleted");
         assert!(g.get("x").await.is_err());
+    }
+
+    /// The first page's `last` link names page 3: pages 2 and 3 can be fetched at once, but
+    /// never from a host other than the API's.
+    #[tokio::test]
+    async fn the_first_page_announces_the_rest_within_the_api() {
+        let page = |link: &'static str| {
+            ScriptedTransport::new(move |_| {
+                ScriptedTransport::reply_with(
+                    200,
+                    serde_json::json!([repo(1, "a")]).to_string(),
+                    &[("link", link)],
+                )
+            })
+        };
+        let g = github(page(
+            r#"<https://api.github.com/organizations/42/repos?per_page=100&page=2>; rel="next", <https://api.github.com/organizations/42/repos?per_page=100&page=3>; rel="last""#,
+        ));
+        assert_eq!(
+            g.page(None).await.unwrap().rest,
+            Some(vec![
+                "https://api.github.com/organizations/42/repos?per_page=100&page=2".into(),
+                "https://api.github.com/organizations/42/repos?per_page=100&page=3".into(),
+            ])
+        );
+        let g = github(page(
+            r#"<https://api.github.com/x?page=2>; rel="next", <https://evil.example/x?page=3>; rel="last""#,
+        ));
+        assert_eq!(g.page(None).await.unwrap().rest, None);
     }
 }

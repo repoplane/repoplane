@@ -41,6 +41,10 @@ pub struct Page {
     pub repos: Vec<Listed>,
     /// `None` on the last page.
     pub next: Option<String>,
+    /// On the first page only, when the forge says how many pages there are: the cursors of
+    /// every other page, so they can be fetched at once rather than one after another. `None`
+    /// leaves the listing to be walked through `next`.
+    pub rest: Option<Vec<String>>,
 }
 
 #[async_trait]
@@ -55,10 +59,10 @@ pub trait Lister: Send + Sync {
     /// previous page's `next` after that.
     async fn page(&self, cursor: Option<&str>) -> Result<Page, ForgeError>;
 
-    /// The default-branch HEAD of each repository, in order. `None` where there is none: an
-    /// empty repository, or one the forge will not read (a disabled Azure DevOps repository).
-    /// Batched where the forge allows it.
-    async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError>;
+    /// The default-branch HEAD of each repository, in order, each with its own outcome: a
+    /// repository that could not be read does not hide the others'. `Ok(None)` where there is no
+    /// HEAD: an empty repository, or one the forge will not read (a disabled Azure DevOps one).
+    async fn heads(&self, repos: &[Listed]) -> Vec<Result<Option<String>, ForgeError>>;
 
     /// Looks one repository up by the forge's own id, outside the listing. `None` when the
     /// forge says it is gone, or it now belongs to another organisation.
@@ -130,9 +134,6 @@ pub fn lister_with_token(
         )?),
     })
 }
-
-/// How many lookups by id an adapter keeps in flight.
-pub const HEAD_CONCURRENCY: usize = 8;
 
 /// The branch whose tip is a repository's HEAD, if there is one to read: an empty repository,
 /// or one with no default branch, has none, and costs no request.

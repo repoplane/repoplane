@@ -5,9 +5,8 @@
 
 use std::sync::Arc;
 
-use futures::stream::{self, StreamExt, TryStreamExt};
-use repoplane_flow::activities::{ListPage, ListedPage, Lookup, ReadHeads};
-use repoplane_forge::{ForgeError, HEAD_CONCURRENCY, Listed, Lister, Transport};
+use repoplane_flow::activities::{ListPage, ListedPage, Lookup, ReadHead};
+use repoplane_forge::{ForgeError, Listed, Lister, Transport};
 use repoplane_proto::inventory::{ConnectionSpec, ObservedHead, RepoSnapshot};
 use temporalio_macros::activities;
 use temporalio_sdk::ApplicationFailure;
@@ -56,27 +55,28 @@ impl ForgeActivities {
         self: Arc<Self>,
         _ctx: ActivityContext,
         input: Lookup,
-    ) -> Result<Vec<RepoSnapshot>, ActivityError> {
+    ) -> Result<Option<RepoSnapshot>, ActivityError> {
         let lister = self.lister(&input.connection)?;
-        let found = lookup(lister.as_ref(), &input.ids).await.map_err(failure)?;
+        let found = lookup(lister.as_ref(), &input.id).await.map_err(failure)?;
         tracing::info!(
             connection = %input.connection.id,
-            unseen = input.ids.len(),
-            still_there = found.len(),
-            "looked up the repositories the listing did not return"
+            id = %input.id,
+            still_there = found.is_some(),
+            "looked up a repository the listing did not return"
         );
         Ok(found)
     }
 
-    #[activity(definition = repoplane_flow::activities::forge_defs::ReadHeads)]
-    pub async fn read_heads(
+    #[activity(definition = repoplane_flow::activities::forge_defs::ReadHead)]
+    pub async fn read_head(
         self: Arc<Self>,
         _ctx: ActivityContext,
-        input: ReadHeads,
-    ) -> Result<Vec<ObservedHead>, ActivityError> {
+        input: ReadHead,
+    ) -> Result<ObservedHead, ActivityError> {
         let lister = self.lister(&input.connection)?;
-        let repos: Vec<RepoSnapshot> = input.targets.into_iter().map(|t| t.repo).collect();
-        read_heads(lister.as_ref(), repos).await.map_err(failure)
+        read_head(lister.as_ref(), input.target.repo)
+            .await
+            .map_err(failure)
     }
 }
 
@@ -88,44 +88,34 @@ pub async fn list_page(
     Ok(ListedPage {
         repos: page.repos.into_iter().map(|l| l.snapshot).collect(),
         next: page.next,
+        rest: page.rest,
     })
 }
 
-/// The repositories among `ids` that still exist in the organisation.
-pub async fn lookup(lister: &dyn Lister, ids: &[String]) -> Result<Vec<RepoSnapshot>, ForgeError> {
-    let lookups: Vec<_> = ids.iter().map(|id| lister.get(id)).collect();
-    let found: Vec<Option<Listed>> = stream::iter(lookups)
-        .buffered(HEAD_CONCURRENCY)
-        .try_collect()
-        .await?;
-    Ok(found.into_iter().flatten().map(|l| l.snapshot).collect())
+/// The repository, if it still exists in the organisation.
+pub async fn lookup(lister: &dyn Lister, id: &str) -> Result<Option<RepoSnapshot>, ForgeError> {
+    Ok(lister.get(id).await?.map(|l| l.snapshot))
 }
 
-/// The HEAD of each repository, in order, each naming the branch it was read from.
-pub async fn read_heads(
+/// The repository's default-branch HEAD, naming the branch it was read from. A failure is the
+/// activity's: Temporal retries it if it may pass, and fails the run if it will not.
+pub async fn read_head(
     lister: &dyn Lister,
-    repos: Vec<RepoSnapshot>,
-) -> Result<Vec<ObservedHead>, ForgeError> {
-    let listed: Vec<Listed> = repos
+    repo: RepoSnapshot,
+) -> Result<ObservedHead, ForgeError> {
+    let listed = [Listed { snapshot: repo }];
+    let head = lister
+        .heads(&listed)
+        .await
         .into_iter()
-        .map(|snapshot| Listed { snapshot })
-        .collect();
-    let heads = lister.heads(&listed).await?;
-    if heads.len() != listed.len() {
-        return Err(ForgeError::protocol(
-            "worker",
-            "heads() answered for a different number of repositories",
-        ));
-    }
-    Ok(listed
-        .into_iter()
-        .zip(heads)
-        .map(|(l, head)| ObservedHead {
-            external_id: l.snapshot.external_id,
-            branch: l.snapshot.default_branch,
-            head,
-        })
-        .collect())
+        .next()
+        .ok_or_else(|| ForgeError::protocol("worker", "heads() answered for no repository"))??;
+    let [Listed { snapshot }] = listed;
+    Ok(ObservedHead {
+        external_id: snapshot.external_id,
+        branch: snapshot.default_branch,
+        head,
+    })
 }
 
 #[cfg(test)]
@@ -135,38 +125,47 @@ mod tests {
     use super::*;
     use crate::fake::{Fake, listed};
 
-    /// The listing skipped `skipped` (a deletion shifted its page) and `gone` really is gone:
-    /// only `skipped` comes back, under its current name.
+    /// A repository the listing skipped still exists, under its current name; one that is
+    /// really gone comes back as `None`.
     #[tokio::test]
     async fn lookup_returns_only_what_still_exists() {
         let fake = Fake::new(HashMap::from([(
             "1".to_string(),
             listed("1", "skipped-renamed"),
         )]));
-        let back = lookup(&fake, &["1".into(), "2".into()]).await.unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0].full_name, "acme/skipped-renamed");
+        let back = lookup(&fake, "1").await.unwrap().unwrap();
+        assert_eq!(back.full_name, "acme/skipped-renamed");
+        assert!(lookup(&fake, "2").await.unwrap().is_none());
         assert_eq!(fake.asked(), vec!["get 1", "get 2"]);
     }
 
     #[tokio::test]
-    async fn heads_come_back_in_order_with_their_branch() {
+    async fn a_head_names_its_branch() {
         let fake = Fake::new(HashMap::new());
-        let repos = vec![listed("1", "a").snapshot, listed("2", "b").snapshot];
-        let heads = read_heads(&fake, repos).await.unwrap();
-        assert_eq!(
-            heads
-                .iter()
-                .map(|h| h.external_id.as_str())
-                .collect::<Vec<_>>(),
-            ["1", "2"]
-        );
-        assert!(heads.iter().all(|h| h.branch.as_deref() == Some("main")));
+        let head = read_head(&fake, listed("1", "a").snapshot).await.unwrap();
+        assert_eq!(head.external_id, "1");
+        assert_eq!(head.branch.as_deref(), Some("main"));
+        assert_eq!(head.head, Some("a".repeat(40)));
+        assert_eq!(fake.asked(), vec!["heads 1"]);
+    }
+
+    /// A transient failure stays retryable, for Temporal to retry; a refusal does not.
+    #[tokio::test]
+    async fn a_failed_read_keeps_its_retryability() {
+        let fake = Fake::new(HashMap::new())
+            .failing("2", true)
+            .failing("3", false);
         assert!(
-            heads
-                .iter()
-                .all(|h| h.head.as_deref() == Some("a".repeat(40).as_str()))
+            read_head(&fake, listed("2", "b").snapshot)
+                .await
+                .unwrap_err()
+                .retryable()
         );
-        assert_eq!(fake.asked(), vec!["heads 2"]);
+        assert!(
+            !read_head(&fake, listed("3", "c").snapshot)
+                .await
+                .unwrap_err()
+                .retryable()
+        );
     }
 }

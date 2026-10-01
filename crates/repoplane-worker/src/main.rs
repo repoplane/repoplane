@@ -38,7 +38,20 @@ struct Config {
     /// The task queue this worker serves: the `queue` of the connections it runs for.
     #[serde(default = "default_queue")]
     queue: String,
-    /// Forge activities run at once.
+    /// Forge activities run at once: the only bound on fan-out. Workflows schedule every page,
+    /// lookup and HEAD read at once, and Temporal hands this worker as many as it has slots.
+    /// A HEAD read is one `git ls-remote`, a process and a TLS handshake, so it takes more in
+    /// flight than API calls to go as fast. Measured on ~125-repository sandboxes, a full head
+    /// refresh (one each, 2026-10-01):
+    ///
+    /// | in flight | GitHub | GitLab | Azure DevOps |
+    /// |---|---|---|---|
+    /// | API (REST/GraphQL), 8 | 7.2 s | 11.0 s | 1.6 s |
+    /// | git, 8 | 10.1 s | 16.5 s | 3.7 s |
+    /// | git, 32 | 3.4 s | 7.7 s | 1.2 s |
+    /// | git, 64 | 4.4 s | 4.9 s | 0.9 s |
+    ///
+    /// 32 also stays well under GitHub's 100 concurrent requests per token, for the listing.
     #[serde(default = "default_concurrency")]
     concurrency: usize,
     #[serde(default)]
@@ -49,7 +62,7 @@ fn default_queue() -> String {
     "default".into()
 }
 fn default_concurrency() -> usize {
-    8
+    32
 }
 
 fn load(cli: &Cli) -> anyhow::Result<Config> {

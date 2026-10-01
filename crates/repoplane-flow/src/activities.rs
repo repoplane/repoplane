@@ -28,19 +28,23 @@ pub struct ListedPage {
     pub repos: Vec<RepoSnapshot>,
     /// `None` on the last page.
     pub next: Option<String>,
+    /// On the first page, when the forge says how many pages there are: every other page's
+    /// cursor, fetched at once.
+    #[serde(default)]
+    pub rest: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lookup {
     pub connection: ConnectionSpec,
-    /// Forge ids of repositories a listing did not return.
-    pub ids: Vec<String>,
+    /// Forge id of a repository a listing did not return.
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadHeads {
+pub struct ReadHead {
     pub connection: ConnectionSpec,
-    pub targets: Vec<HeadTarget>,
+    pub target: HeadTarget,
 }
 
 pub struct Forge;
@@ -53,15 +57,15 @@ impl Forge {
         unimplemented!()
     }
 
-    /// The repositories among `ids` that still exist in the organisation; the others are gone.
+    /// The repository, if it still exists in the organisation; `None` when it is gone.
     #[activity]
-    pub fn lookup(input: Lookup) -> Result<Vec<RepoSnapshot>, ActivityError> {
+    pub fn lookup(input: Lookup) -> Result<Option<RepoSnapshot>, ActivityError> {
         unimplemented!()
     }
 
-    /// The default-branch HEAD of each target, in order.
+    /// The target's default-branch HEAD, naming the branch it was read from.
     #[activity]
-    pub fn read_heads(input: ReadHeads) -> Result<Vec<ObservedHead>, ActivityError> {
+    pub fn read_head(input: ReadHead) -> Result<ObservedHead, ActivityError> {
         unimplemented!()
     }
 }

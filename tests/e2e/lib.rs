@@ -472,25 +472,21 @@ fn free_port() -> anyhow::Result<u16> {
 
 impl Stack {
     /// The fields of the worker's latest log line containing `message`, ANSI colour removed.
-    pub fn worker_log_field(&self, message: &str, field: &str) -> Option<String> {
-        let raw = std::fs::read_to_string(self.logs.join("worker.log")).ok()?;
-        let mut plain = String::with_capacity(raw.len());
-        let mut chars = raw.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for d in chars.by_ref() {
-                    if d == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                plain.push(c);
-            }
-        }
-        let line = plain.lines().rev().find(|l| l.contains(message))?;
-        line.split_whitespace()
-            .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
-            .map(str::to_string)
+    /// How much the worker has logged so far, to read only what comes after.
+    pub fn worker_log_len(&self) -> usize {
+        std::fs::read_to_string(self.logs.join("worker.log"))
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Worker log lines after `mark` containing both `message` and `needle`.
+    pub fn worker_log_count_since(&self, mark: usize, message: &str, needle: &str) -> usize {
+        let raw = std::fs::read_to_string(self.logs.join("worker.log")).unwrap_or_default();
+        let plain = strip_ansi(raw.get(mark..).unwrap_or(""));
+        plain
+            .lines()
+            .filter(|l| l.contains(message) && l.contains(needle))
+            .count()
     }
 
     /// Postgres and Temporal in containers; the API and the worker as real processes, the
@@ -1020,4 +1016,22 @@ async fn forward(
         *s.page_one.lock().unwrap() = names;
     }
     (status, out_headers, bytes).into_response()
+}
+
+/// `s` without its ANSI colour codes.
+fn strip_ansi(s: &str) -> String {
+    let mut plain = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
 }

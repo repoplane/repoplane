@@ -11,6 +11,8 @@ use repoplane_proto::inventory::RepoSnapshot;
 pub struct Fake {
     repos: HashMap<String, Listed>,
     asked: Mutex<Vec<String>>,
+    /// Repositories whose HEAD read fails, and whether that failure is retryable.
+    failing: HashMap<String, bool>,
 }
 
 impl Fake {
@@ -18,7 +20,14 @@ impl Fake {
         Fake {
             repos,
             asked: Mutex::new(Vec::new()),
+            failing: HashMap::new(),
         }
+    }
+
+    /// Makes reading `id`'s HEAD fail, retryably or not.
+    pub fn failing(mut self, id: &str, retryable: bool) -> Fake {
+        self.failing.insert(id.to_string(), retryable);
+        self
     }
 
     /// What it was asked, in order: `get <id>`, `heads <n>`.
@@ -54,15 +63,28 @@ impl Lister for Fake {
         Ok(Page {
             repos: self.repos.values().cloned().collect(),
             next: None,
+            rest: None,
         })
     }
 
-    async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
+    async fn heads(&self, repos: &[Listed]) -> Vec<Result<Option<String>, ForgeError>> {
         self.asked
             .lock()
             .unwrap()
             .push(format!("heads {}", repos.len()));
-        Ok(repos.iter().map(|_| Some("a".repeat(40))).collect())
+        repos
+            .iter()
+            .map(|r| match self.failing.get(&r.snapshot.external_id) {
+                Some(true) => Err(ForgeError::Transport {
+                    forge: "fake",
+                    method: "git ls-remote".into(),
+                    path: "/".into(),
+                    message: "connection reset".into(),
+                }),
+                Some(false) => Err(ForgeError::Config("the token was refused".into())),
+                None => Ok(Some("a".repeat(40))),
+            })
+            .collect()
     }
 
     async fn get(&self, id: &str) -> Result<Option<Listed>, ForgeError> {

@@ -34,7 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut ids = HashSet::new();
     loop {
         let page = l.page(cursor.as_deref()).await?;
-        let heads = l.heads(&page.repos).await?;
+        let heads = l
+            .heads(&page.repos)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
         pages += 1;
         for (r, h) in page.repos.iter().zip(heads) {
             let s = &r.snapshot;

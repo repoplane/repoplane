@@ -94,8 +94,18 @@ Campaigns will need all of this: waiting for merges, waves, pausing.
 
 | Workflow | Steps |
 |---|---|
-| `ReconcileWorkflow` (`connection reconcile`) | `start_reconcile` → for each page: `list_page` → `record_page` → `unseen` → in batches of 100: `lookup` by id → `record_page` for the ones still there → `finish_reconcile`, which marks the rest inaccessible. Marking happens only after the whole listing and the lookups succeeded (ADR 0005). |
-| `RefreshHeadsWorkflow` (`repo refresh-heads`) | `start_refresh` (targets fixed at request) → in batches of 100: `read_heads` → `record_heads` (target-scoped, branch-guarded, each target counted once) → `finish_refresh` |
+| `ReconcileWorkflow` (`connection reconcile`) | `start_reconcile` → `list_page` for the first page → `record_page`. If that page said how many pages there are, every other page is scheduled at once; otherwise they are walked one by one. Pages are recorded one after another either way. Then `unseen` → one `lookup` by id per unseen repository, all at once → `record_page` for the ones still there → `finish_reconcile`, which marks the rest inaccessible. Marking happens only after the whole listing and the lookups succeeded (ADR 0005). |
+| `RefreshHeadsWorkflow` (`repo refresh-heads`) | `start_refresh` (targets fixed at request) → one `read_head` per target, all at once → `record_heads` (target-scoped, branch-guarded, each target counted once) → `finish_refresh` |
+
+Workflows size no batches. They schedule every page, lookup and HEAD read at once, and the
+worker's activity slots (`concurrency`, 32 by default) are the only bound on how many run at a
+time: Temporal hands a worker as many tasks as it has free slots. Each forge step is retried on
+its own, so one repository the forge could not answer for is retried alone.
+
+The cost is workflow history: about three events per activity, so a head refresh of N
+repositories is about 3N events. Temporal warns at 10,240 events and stops a workflow at 51,200,
+which puts a single refresh's ceiling near 17,000 repositories. Beyond that, the Temporal answer
+is child workflows over slices of the targets; it is not built yet.
 
 Forge steps retry 8 times, backing off from 1s to 60s. A failure the worker marks non-retryable
 (a refused token, a missing variable, a protocol violation) fails the run at once. The run's
@@ -109,8 +119,9 @@ current code, so a change that would strand runs in flight fails `make unit`.
 
 Three forge activities, thin wrappers over `repoplane-forge`:
 - `list_page`: one page of the organisation.
-- `lookup`: the given ids that still exist in the organisation.
-- `read_heads`: default-branch HEADs, each naming its branch, read with `git ls-remote` (below).
+- `lookup`: one repository by id, if it still exists in the organisation.
+- `read_head`: one repository's default-branch HEAD, naming its branch, read with `git ls-remote`
+  (below).
 
 A forge error becomes a retryable activity failure when the forge was busy or unreachable, and a
 non-retryable one otherwise. `concurrency` bounds the activities run at once.
@@ -149,7 +160,7 @@ therefore the cost of a refresh, paid only for its targets. An empty repository 
 `head: null` (`—` in the CLI); that is a fact about the repository, not a failed read.
 
 **HEADs are read over git, not over the API.** One `git ls-remote <remote> refs/heads/<branch>`
-per repository, up to 32 at once. Git traffic is not counted against the REST and GraphQL
+per repository, one activity each, as many at once as the worker has slots. Git traffic is not counted against the REST and GraphQL
 budgets, which is what made API-read HEADs expensive:
 - GitHub limits GraphQL to 60 s of CPU time per minute, which caps HEADs read that way near 600 a
   minute, whatever the concurrency.
@@ -165,9 +176,16 @@ How the remote is built:
   variables pass through.
 - Empty and disabled repositories cost no call.
 
-Measured on the sandboxes (about 125 repos each), a full refresh took 3.4 s on GitHub, 7.7 s on
-GitLab and 1.2 s on Azure DevOps, against 7.2 s, 11.0 s and 1.6 s through the APIs before. The
-worker needs `git` on its `PATH`.
+Measured on the sandboxes (about 125 repos each), a full refresh with 32 slots takes 3.3 s on
+GitHub, 4.4 s on GitLab and 1.6 s on Azure DevOps (median of three runs, 2026-10-01), against
+7.2 s, 11.0 s and 1.6 s through the APIs before. The worker needs `git` on its `PATH`.
+
+**Listing pages are all scheduled at once when the forge says how many there are.** The first page's
+`Link rel="last"` names the last page: GitHub, Forgejo and GitLab send it (gitlab.com stops
+counting above 10,000 projects). The other pages' URLs must stay under the configured API, or
+the listing is walked instead. Azure DevOps answers the whole organisation in one call. On the
+two-page sandboxes this changes nothing measurable; it is for organisations of thousands of
+repositories, where a page-by-page walk takes a round trip per page.
 
 ## Crates and the boundaries between them
 

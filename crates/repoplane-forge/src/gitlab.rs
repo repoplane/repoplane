@@ -205,6 +205,16 @@ impl Lister for Gitlab {
                 ));
             }
         }
+        // On the first page, the `last` link says how many pages there are; their URLs are
+        // fetched at once. Each must stay under the API this connection names.
+        let rest = if cursor.is_none() {
+            link::rest_of(answer.header("link")).filter(|urls| {
+                urls.iter()
+                    .all(|u| u.starts_with(&format!("{}/", self.api)))
+            })
+        } else {
+            None
+        };
         Ok(Page {
             repos: projects
                 .into_iter()
@@ -212,14 +222,12 @@ impl Lister for Gitlab {
                 .map(Project::into_listed)
                 .collect(),
             next,
+            rest,
         })
     }
 
-    async fn heads(&self, repos: &[Listed]) -> Result<Vec<Option<String>>, ForgeError> {
-        let remotes = repos
-            .iter()
-            .map(|r| self.remote(&r.snapshot))
-            .collect::<Result<Vec<_>, _>>()?;
+    async fn heads(&self, repos: &[Listed]) -> Vec<Result<Option<String>, ForgeError>> {
+        let remotes = repos.iter().map(|r| self.remote(&r.snapshot)).collect();
         git::heads(FORGE, remotes, &self.git).await
     }
 
@@ -481,5 +489,35 @@ mod tests {
         );
         assert!(g.get("9").await.unwrap().is_none(), "pending deletion");
         assert!(g.get("10").await.unwrap().is_none(), "deleted");
+    }
+
+    /// With a `last` link (GitLab sends one while it counts, under 10,000 projects) the rest of
+    /// the listing is announced; without one, it is walked.
+    #[tokio::test]
+    async fn the_first_page_announces_the_rest_when_gitlab_counts() {
+        let t = ScriptedTransport::new(|_| {
+            ScriptedTransport::reply_with(
+                200,
+                serde_json::json!([project(1, "acme/a")]).to_string(),
+                &[(
+                    "link",
+                    r#"<http://g/api/v4/groups/acme/projects?page=2&per_page=100>; rel="next", <http://g/api/v4/groups/acme/projects?page=2&per_page=100>; rel="last""#,
+                )],
+            )
+        });
+        let rest = gitlab(t, "acme").page(None).await.unwrap().rest.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert!(
+            rest[0].starts_with("http://g/api/v4/groups/acme/projects?")
+                && rest[0].ends_with("page=2")
+        );
+        let t = ScriptedTransport::new(|_| {
+            ScriptedTransport::reply_with(
+                200,
+                serde_json::json!([project(1, "acme/a")]).to_string(),
+                &[("x-next-page", "2")],
+            )
+        });
+        assert_eq!(gitlab(t, "acme").page(None).await.unwrap().rest, None);
     }
 }
