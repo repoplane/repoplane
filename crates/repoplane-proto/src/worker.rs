@@ -79,6 +79,9 @@ pub struct HeadTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservedHead {
     pub external_id: String,
+    /// The branch the HEAD was read from. If a reconcile has since recorded another default
+    /// branch, this HEAD describes the old one and is dropped.
+    pub branch: Option<String>,
     pub head: Option<String>,
 }
 

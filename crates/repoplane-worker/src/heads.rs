@@ -67,6 +67,7 @@ async fn read(
         .zip(heads)
         .map(|(l, head)| ObservedHead {
             external_id: l.snapshot.external_id,
+            branch: l.snapshot.default_branch,
             head,
         })
         .collect())
@@ -101,6 +102,8 @@ mod tests {
                 .iter()
                 .all(|h| h.head.as_deref() == Some("a".repeat(40).as_str()))
         );
+        // Each HEAD names the branch it was read from, so a stale one can be told apart.
+        assert!(heads.iter().all(|h| h.branch.as_deref() == Some("main")));
         assert_eq!(fake.asked(), vec!["heads 2"]);
     }
 }

@@ -71,6 +71,15 @@ struct Existing {
 }
 
 #[derive(sqlx::FromRow)]
+struct Target {
+    id: Uuid,
+    external_id: String,
+    default_branch: Option<String>,
+    head_sha: Option<String>,
+    head_observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
 struct TargetRow {
     external_id: String,
     full_name: String,
@@ -144,8 +153,9 @@ impl Store {
             }
             "refresh_heads" => {
                 let (id,): (Uuid,) = sqlx::query_as(
-                    "update head_refreshes set status = 'running',
-                            started_at = coalesce(started_at, now()), observed = 0, changed = 0
+                    // Counts carry over a retry: HEADs an earlier attempt recorded are counted,
+                    // and `upload_heads` counts each target once per refresh.
+                    "update head_refreshes set status = 'running', started_at = coalesce(started_at, now())
                      where task_id = $1 returning id",
                 )
                 .bind(row.task_id)
@@ -165,7 +175,7 @@ impl Store {
                     "select r.external_id, r.full_name, r.name, r.default_branch, r.archived,
                             r.topics, r.empty, r.web_url, r.locator
                      from head_refreshes h join repositories r on r.id = any(h.targets)
-                     where h.id = $1 and r.status = 'active'
+                     where h.id = $1 and r.status = 'active' and r.locator <> ''
                      order by r.full_name",
                 )
                 .bind(id)
@@ -327,8 +337,13 @@ impl Store {
         Ok(UploadOutcome { recorded })
     }
 
-    /// Records HEADs a refresh read. A HEAD is *changed* when it differs from the recorded one,
-    /// a first observation included. Returns how many changed.
+    /// Records HEADs a refresh read, and returns how many changed.
+    ///
+    /// Only the refresh's own targets are written, and only while still active. A HEAD read
+    /// from a branch that is no longer the default (a reconcile recorded the change while the
+    /// refresh ran) describes the old branch and is dropped. Each target counts once per
+    /// refresh, retries included: *observed* when first recorded, *changed* when that differs
+    /// from what was recorded before the refresh.
     pub async fn upload_heads(
         &self,
         task: TaskId,
@@ -338,8 +353,8 @@ impl Store {
     ) -> Result<i64> {
         let mut tx = self.pool.begin().await?;
         self.extend(&mut tx, task, lease_id, ttl_secs).await?;
-        let (refresh_id, connection_id): (Uuid, Uuid) =
-            sqlx::query_as("select id, connection_id from head_refreshes where task_id = $1")
+        let (refresh_id, started_at): (Uuid, DateTime<Utc>) =
+            sqlx::query_as("select id, started_at from head_refreshes where task_id = $1")
                 .bind(task.uuid())
                 .fetch_optional(&mut *tx)
                 .await?
@@ -355,32 +370,39 @@ impl Store {
             }
         }
         let ids: Vec<&str> = heads.iter().map(|h| h.external_id.as_str()).collect();
-        let before: HashMap<String, Option<String>> = sqlx::query_as::<_, (String, Option<String>)>(
-            "select external_id, head_sha from repositories where connection_id = $1 and external_id = any($2)",
+        let targets: HashMap<String, Target> = sqlx::query_as::<_, Target>(
+            "select r.id, r.external_id, r.default_branch, r.head_sha, r.head_observed_at
+             from head_refreshes h join repositories r on r.id = any(h.targets)
+             where h.id = $1 and r.status = 'active' and r.external_id = any($2)
+             for update of r",
         )
-        .bind(connection_id)
+        .bind(refresh_id)
         .bind(&ids)
         .fetch_all(&mut *tx)
         .await?
         .into_iter()
+        .map(|t| (t.external_id.clone(), t))
         .collect();
         let mut changed = 0i64;
         let mut observed = 0i64;
         for h in heads {
-            // A repository removed from the inventory since the refresh started is skipped.
-            let Some(prior) = before.get(&h.external_id) else {
-                continue;
+            let Some(t) = targets.get(&h.external_id) else {
+                continue; // not a target of this refresh, or gone inaccessible since
             };
-            observed += 1;
-            if *prior != h.head {
-                changed += 1;
+            if t.default_branch != h.branch {
+                continue; // read from a branch that is no longer the default
+            }
+            let first_this_refresh = t.head_observed_at.is_none_or(|at| at < started_at);
+            if first_this_refresh {
+                observed += 1;
+                if t.head_sha != h.head {
+                    changed += 1;
+                }
             }
             sqlx::query(
-                "update repositories set head_sha = $3, head_observed_at = now()
-                 where connection_id = $1 and external_id = $2",
+                "update repositories set head_sha = $2, head_observed_at = now() where id = $1",
             )
-            .bind(connection_id)
-            .bind(&h.external_id)
+            .bind(t.id)
             .bind(&h.head)
             .execute(&mut *tx)
             .await?;

@@ -16,3 +16,8 @@ sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+testcontainers = "0.28"
+sqlx.workspace = true

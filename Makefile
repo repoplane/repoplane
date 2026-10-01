@@ -5,7 +5,7 @@ REPOPLANE_FLEETS_DIR ?= $(abspath ../fleets)
 export REPOPLANE_FLEETS_DIR
 SANDBOX ?= local
 
-.PHONY: help build lint boundaries unit e2e e2e-all ci up down
+.PHONY: help build lint boundaries unit db e2e e2e-all ci up down
 
 ## Show this help
 help:
@@ -38,6 +38,10 @@ boundaries:
 unit:
 	cargo test --workspace --exclude repoplane-e2e
 
+## The queue against a real Postgres: races and retries no e2e run can hit on purpose (Docker)
+db:
+	REPOPLANE_DB_TESTS=1 cargo test -p repoplane-store --test queue
+
 ## End-to-end on one fleets sandbox: SANDBOX=local (Docker) | gh | gl | ado (tokens: source ../fleets/.env)
 e2e: build
 	REPOPLANE_E2E_SANDBOX=$(SANDBOX) cargo test -p repoplane-e2e -- --nocapture
@@ -47,7 +51,7 @@ e2e-all: build
 	@for s in local gh gl ado; do REPOPLANE_E2E_SANDBOX=$$s cargo test -p repoplane-e2e -- --nocapture || exit 1; done
 
 ## What CI runs on a pull request
-ci: lint unit
+ci: lint unit db
 	$(MAKE) e2e SANDBOX=local
 
 ## Postgres + a local Forgejo for trying the CLI by hand (see README)

@@ -103,6 +103,7 @@ where a name belongs is refused.
 ```sh
 make lint       # fmt, clippy, and the component boundaries (make boundaries)
 make unit       # unit tests: no Docker, no network
+make db         # the task queue against a real Postgres (Docker)
 make e2e        # end-to-end on a local Forgejo (Docker)
 make e2e SANDBOX=gh|gl|ado    # on a real sandbox: source ../fleets/.env first
 make e2e-all    # all four

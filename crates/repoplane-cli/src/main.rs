@@ -269,10 +269,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             let mut status = ReconcileOrRefresh::default();
             let mut out_table = String::new();
             let mut out_json = Vec::new();
+            // One deadline for all of them: --timeout bounds the command, not each refresh.
+            let deadline = Instant::now() + timeout;
             for (name, r) in runs {
                 let id = r.id.to_string();
                 let r = if wait {
-                    wait_until(timeout, |w| api.head_refresh_status(&id, w), |r| r.status).await?
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    wait_until(left, |w| api.head_refresh_status(&id, w), |r| r.status).await?
                 } else {
                     r
                 };
@@ -353,11 +356,7 @@ where
         let st = status(&r);
         if st.is_terminal() || Instant::now() >= deadline {
             if !st.is_terminal() {
-                eprintln!(
-                    "repoplane: still {} after {}s",
-                    st.as_str(),
-                    timeout.as_secs()
-                );
+                eprintln!("repoplane: still {} when --timeout ran out", st.as_str());
             }
             return Ok(r);
         }

@@ -2467,7 +2467,9 @@ dependencies = [
  "repoplane-proto",
  "serde_json",
  "sqlx",
+ "testcontainers",
  "thiserror",
+ "tokio",
  "tracing",
  "uuid",
 ]

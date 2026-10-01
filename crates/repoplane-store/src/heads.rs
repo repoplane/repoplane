@@ -58,6 +58,9 @@ impl Store {
         let targets: Vec<Uuid> = sqlx::query_scalar(
             "select id from repositories
              where connection_id = $1 and status = 'active'
+               -- Without a locator the worker cannot find a repository again; the next
+               -- reconcile writes one (rows recorded before migration 0002 have none).
+               and locator <> ''
                and ($2::text is null or $2 = any(topics))
                and ($3::boolean is null or archived = $3)
              order by full_name",
