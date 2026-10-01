@@ -39,38 +39,45 @@ the repoplane API.
 ```mermaid
 flowchart LR
     cli["<b>repoplane</b><br/>CLI · Rust"]
-    api["<b>repoplane-api</b><br/>Rust · axum · sqlx"]
-    pg[("Postgres<br/>product state + task queue")]
-    worker["<b>repoplane-worker</b><br/>Rust · tokio · reqwest"]
+    api["<b>repoplane-api</b><br/>Rust · axum · sqlx<br/>+ Temporal control worker"]
+    pg[("Postgres<br/>product state")]
+    temporal[("Temporal<br/>process state")]
+    worker["<b>repoplane-worker</b><br/>Rust · Temporal activity worker"]
     forge["Forge APIs"]
 
     cli -- "HTTPS /v1<br/>admin token" --> api
     api --- pg
-    worker -- "HTTPS /v1/worker, outbound only<br/>lease · pages · complete<br/>queue token" --> api
+    api -- "start workflows;<br/>serve queue repoplane-control" --> temporal
+    worker -- "gRPC, outbound only<br/>serve the connection's queue" --> temporal
     worker -- "HTTPS, forge token" --> forge
 ```
 
 | Container | Owns | Talks to | Never |
 |---|---|---|---|
-| `repoplane` (CLI) | nothing | the API's `/v1` | touches the database or a forge; links neither |
-| `repoplane-api` | Postgres: connections, inventory, runs, the task queue; migrations | Postgres; serves `/v1` and `/v1/worker` | calls a forge; holds a forge credential |
-| `repoplane-worker` | the forge tokens (read from the variables each connection names) | the API's `/v1/worker` over outbound HTTPS; forges | opens a database; accepts a connection |
+| `repoplane` (CLI) | nothing | the API's `/v1` | touches the database, Temporal or a forge; links none of them |
+| `repoplane-api` | Postgres: connections, inventory, runs; migrations. Runs the workflows and the Postgres activities | Postgres; Temporal; serves `/v1` | calls a forge; holds a forge credential |
+| `repoplane-worker` | the forge tokens (read from the variables each connection names) | Temporal, outbound; forges | opens a database; calls the repoplane API; accepts a connection |
+| Temporal | process state: what step each run is at, timers, retries, signals | — | holds a secret (inputs carry variable *names*) |
 
-**Worker ↔ API are task queues, the way Temporal workers poll Temporal.** A worker long-polls
-`POST /v1/worker/lease` for its queue, reports what it finds, and completes or fails the task.
-Every connection names a queue (`default` unless told otherwise). One code base therefore gives
-three deployments:
+**Temporal orchestrates; Postgres is product state** ([ADR 0012](adr/0012-temporal-orchestrates.md)).
+A run is a Temporal workflow whose id is the run's id (`rec_…`, `hrf_…`). Each of its steps is an
+activity on an explicit task queue:
+
+- Postgres steps go to `repoplane-control`, served by the API process.
+- Forge steps go to the connection's own queue (`default` unless set), served by workers.
+
+One code base therefore gives three deployments:
 
 ```text
-Single node          docker compose: api + postgres + worker
-Full on-premises     api + postgres + workers, all inside the customer's network
-Hybrid (Cloud)       api hosted by Repoplane Cloud; the customer runs only workers on its own queue,
-                     so tokens and source code never leave its network, only inventory metadata does
+Single node          docker compose: api + postgres + temporal + worker
+Full on-premises     api + postgres + Temporal + workers, all inside the customer's network
+Hybrid (Cloud)       api and Temporal hosted (Repoplane Cloud / Temporal Cloud); the customer runs only
+                     workers on its own queue, so tokens and source code never leave its network
 ```
 
-The link is HTTPS long-poll rather than gRPC or a broker. One protocol serves the CLI, the
-workers and the enterprise plane, and it passes the HTTP proxies and TLS inspection that bank
-networks put in the way ([ADR 0008](adr/0008-http-task-queues.md)).
+Temporal gives each run durable retries with backoff. A run survives any of its processes
+dying, and timers measured in days are just a step that waits; signals reach a run in flight.
+Campaigns will need all of this: waiting for merges, waves, pausing.
 
 ## Level 3: components
 
@@ -78,23 +85,37 @@ networks put in the way ([ADR 0008](adr/0008-http-task-queues.md)).
 
 | Component | Responsibility |
 |---|---|
-| `http` public (`/v1`) | connections, reconciles and head refreshes (each with `?wait=` long-poll), repositories (filtered, keyset-paged). Admin bearer token. |
-| `http` worker (`/v1/worker`) | lease, heartbeat, page upload, unseen, heads upload, complete, fail. One bearer token per queue; every call after the lease names the lease id. |
-| `store` queue | Postgres task queue: `FOR UPDATE SKIP LOCKED` leases with a TTL, re-lease on expiry, bounded retries. |
-| `store` inventory | upsert keyed on `(connection, forge id)`, a per-run watermark, and inaccessible marking after a complete listing only. |
-| `store` migrations | embedded; applied by `repoplane-api migrate` only; `serve` refuses a schema other than its own. |
+| `http` (`/v1`) | connections, reconciles and head refreshes (each with `?wait=` long-poll on Postgres), repositories (filtered, keyset-paged). Admin bearer token. Asking for a run records it, then starts its workflow; if Temporal will not take it, the run is recorded failed and the call answers 503. |
+| `control` | the Postgres activities: one store call each, safe to repeat; a refusal from the store is non-retryable |
+| control worker | Temporal worker on `repoplane-control`, hosting `ReconcileWorkflow` and `RefreshHeadsWorkflow` and the control activities; it shares the process and the shutdown with the HTTP server |
+| `store` | run steps (`start_*`, `record_*`, `unseen`, `finish_*`, `fail_*`), the inventory upsert (identity by forge id, watermark, never delete), migrations |
+
+### repoplane-flow (the workflows)
+
+| Workflow | Steps |
+|---|---|
+| `ReconcileWorkflow` (`connection reconcile`) | `start_reconcile` → for each page: `list_page` → `record_page` → `unseen` → in batches of 100: `lookup` by id → `record_page` for the ones still there → `finish_reconcile`, which marks the rest inaccessible. Marking happens only after the whole listing and the lookups succeeded (ADR 0005). |
+| `RefreshHeadsWorkflow` (`repo refresh-heads`) | `start_refresh` (targets fixed at request) → in batches of 100: `read_heads` → `record_heads` (target-scoped, branch-guarded, each target counted once) → `finish_refresh` |
+
+Forge steps retry 8 times, backing off from 1s to 60s. A failure the worker marks non-retryable
+(a refused token, a missing variable, a protocol violation) fails the run at once. The run's
+record then says why, from the forge's own message.
+
+Every activity's input and output lives in workflow history, so none carries a secret: a
+connection travels as its *variable name*. A replay test replays recorded histories against the
+current code, so a change that would strand runs in flight fails `make unit`.
 
 ### repoplane-worker
 
-| Component | Responsibility |
-|---|---|
-| poller | lease loop, bounded concurrency, graceful shutdown (in-flight forge calls are cancelled, and the task goes back on the queue) |
-| reconcile | *what exists*: page → upload, repeated to the last page; then every repository the run did not see is looked up by id, and those still there are uploaded; then complete. No HEAD is read |
-| head refresh | *what each repository holds*: the default-branch HEAD of the repositories the refresh was given (a connection's, or a filter's), read and reported in batches of 100 |
-| task | what both share: the lease, a background heartbeat that keeps it through long rate-limit pauses, complete or fail |
-| `repoplane-forge` | the four `Lister` adapters and the shared HTTP layer |
+Three forge activities, thin wrappers over `repoplane-forge`:
+- `list_page`: one page of the organisation.
+- `lookup`: the given ids that still exist in the organisation.
+- `read_heads`: default-branch HEADs, each naming its branch.
 
-### repoplane-forge
+A forge error becomes a retryable activity failure when the forge was busy or unreachable, and a
+non-retryable one otherwise. `concurrency` bounds the activities run at once.
+
+### repoplane-forge (the adapters)
 
 ```rust
 trait Lister {
@@ -131,7 +152,8 @@ therefore the cost of a refresh, paid only for its targets. An empty repository 
 
 ```text
 crates/
-  repoplane-proto    identifiers, API bodies, worker protocol. The ONLY crate every binary links.
+  repoplane-proto    identifiers, API bodies, what crosses an activity. Linked by everything.
+  repoplane-flow     workflows and activity definitions. Linked by the API and the worker.
   repoplane-forge    the four adapters and the HTTP layer. Linked by the worker only.
   repoplane-store    Postgres store and migrations. Linked by the API only.
   repoplane-api      bin repoplane-api
@@ -140,37 +162,60 @@ crates/
 tests/e2e            the end-to-end suite (test-only; links forgelab)
 ```
 
-`make boundaries` checks these rules against the dependency graph (`cargo tree`) on every lint:
-the CLI links neither `sqlx` nor a forge client, the worker links no `sqlx`, and the API links no
-forge client and no HTTP client. So "the component with the database cannot reach a forge" is a
-property of the build, not just a claim.
+The activity definitions in `repoplane-flow` are implemented on the other side with
+`#[activity(definition = …)]`. A mismatch between what a workflow calls and what a worker
+implements is therefore a compile error.
+
+`make boundaries` checks the rules against the dependency graph (`cargo tree`) on every lint:
+- the CLI links no Temporal, no `sqlx` and no forge client;
+- the worker links no `sqlx`;
+- the API links no forge client and no HTTP client;
+- the workflows link no `sqlx` and no forge client.
+
+So "the component with the database cannot reach a forge" is a property of the build, not just a
+claim.
 
 ## Identifiers
 
 A UUIDv7 written as a type prefix and 26 characters of Crockford base32, such as
 `rec_06G9N084KXVH9BQD3DW01R4TA4`. It says what it names, sorts by creation, and cannot be
-misread (no `I`, `L`, `O` or `U`). The prefixes are `org_`, `con_`, `rep_`, `rec_` and `tsk_`.
+misread (no `I`, `L`, `O` or `U`). The prefixes are `org_`, `con_`, `rep_`, `rec_` and `hrf_`. A
+run's id is also its Temporal workflow id.
 
 ## Secrets
 
-Secrets are named, never written. The API's config names the variables that hold its database
-URL, admin token and queue tokens. A connection stores the *name* of the variable that holds its
-forge token, and only a worker reads it. The CLI's contexts file names the variable that holds
-the API token. No flag takes a secret, and a value that looks like one is refused where a
-variable name is expected.
+Secrets are named, never written:
+- The API's config names the variables that hold its database URL, its admin token and, for
+  Temporal Cloud, the Temporal API key.
+- A connection stores the *name* of the variable that holds its forge token. Only a worker
+  reads it, inside the activity, so it never enters workflow history.
+- The CLI's contexts file names the variable that holds the API token.
+
+No flag takes a secret, and a value that looks like one is refused where a variable name is
+expected.
 
 ## Testing
 
-The main suite is end-to-end on the **fleets** sandboxes: a local Forgejo, and the
-`repoplane-sandbox` organisations on GitHub, GitLab and Azure DevOps. It runs the real API,
-worker and CLI binaries. What each sandbox should hold comes from the fleets' `fleet.lock.json`
-files, never from test code. Each mutating scenario changes the real forge (a topic, a pushed
-commit, an archive, a deletion on local) and asserts that the next reconcile records exactly
-that. Then forgelab `reset`s the sandbox and `verify`s it, and a reconcile must bring the
-inventory back to the locks. See [`../tests/e2e`](../tests/e2e) and the README.
+- **Unit (`make unit`):** the four adapters against scripted HTTP; the worker's activities; the
+  workflow replay test against recorded histories (`REPOPLANE_RECORD_HISTORIES=1 make e2e`
+  re-records them).
+- **Store (`make db`):** the run steps against a real Postgres, covering what Temporal's timing
+  decides — a step repeated after its commit, a reconcile landing in the middle of a refresh.
+- **End-to-end (`make e2e SANDBOX=…`):** the real API, worker and CLI, with Postgres and a
+  Temporal dev server in containers, on the **fleets** sandboxes: a local Forgejo, and the
+  `repoplane-sandbox` organisations on GitHub, GitLab and Azure DevOps.
+  - What each sandbox should hold comes from the fleets' `fleet.lock.json`, never from test code.
+  - Mutating scenarios change the real forge, assert the next run records exactly that, then
+    forgelab resets and verifies the sandbox.
+  - On local, three scenarios use a fault proxy in front of Forgejo: a listing that shifts under
+    a deletion, a rate limit longer than one call's budget (retried by Temporal), and a refused
+    token (fails fast).
+  - A fourth local scenario kills the worker in the middle of a run; the run waits, and
+    completes when a worker returns.
 
 ## Known gaps
 
 - Listing pages are fetched one after another. For fleets in the thousands, planned page
-  fan-out (the Go draft's approach) comes later.
-- No rate budget is shared across workers yet: each HTTP client waits out the limits it meets.
+  fan-out (the Go draft's approach) comes later, as will continue-as-new for very long runs.
+- Workers serving the same namespace can poll each other's queues; Temporal Cloud namespaces
+  (one per tenant) are the boundary. Per-queue authorisation would need Temporal's own.

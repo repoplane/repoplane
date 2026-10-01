@@ -1,18 +1,17 @@
-//! Postgres: the product state (connections, repositories, reconcile runs) and the task queue
+//! Postgres: the product state — connections, repositories, and the runs that fill them.
 //! workers lease from. Only the API links this crate; a worker never opens a database (ADR 0001).
 
 mod heads;
-mod queue;
 mod repos;
+mod runs;
 
 use chrono::{DateTime, Utc};
 use repoplane_proto::api::{AuthMode, Connection, CreateConnection, Reconcile, RunStatus};
-use repoplane_proto::id::{ConnectionId, OrgId, ReconcileId, TaskId};
+use repoplane_proto::id::{ConnectionId, OrgId, ReconcileId};
 use repoplane_proto::{ForgeKind, secret};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
-pub use queue::{Leased, UploadOutcome};
 pub use repos::{RepoFilter, RepoPage};
 
 /// The organisation of a single-tenant install, created by the first migration.
@@ -32,9 +31,6 @@ pub enum StoreError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
-    /// A worker's lease was expired and handed on; it must stop.
-    #[error("lease lost: the task was handed to another worker")]
-    LeaseLost,
     #[error("schema is at version {have}, this build needs {want}: run `repoplane-api migrate`")]
     Schema { have: i64, want: i64 },
     #[error(transparent)]
@@ -188,23 +184,13 @@ impl Store {
             tx.commit().await?;
             return Ok((self.reconcile(ReconcileId::from_uuid(id)).await?, false));
         }
-        let task = TaskId::new();
         let rec = ReconcileId::new();
         sqlx::query(
-            "insert into tasks (id, organization_id, queue, kind, state) values ($1, $2, $3, 'reconcile', 'queued')",
-        )
-        .bind(task.uuid())
-        .bind(self.org.uuid())
-        .bind(&connection.queue)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "insert into reconciles (id, organization_id, connection_id, task_id, status) values ($1, $2, $3, $4, 'queued')",
+            "insert into reconciles (id, organization_id, connection_id, status) values ($1, $2, $3, 'queued')",
         )
         .bind(rec.uuid())
         .bind(self.org.uuid())
         .bind(connection.id.uuid())
-        .bind(task.uuid())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

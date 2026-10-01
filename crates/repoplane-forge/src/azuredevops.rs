@@ -17,7 +17,7 @@ use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use http::{HeaderMap, Response};
 use repoplane_proto::ForgeKind;
-use repoplane_proto::worker::RepoSnapshot;
+use repoplane_proto::inventory::RepoSnapshot;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 

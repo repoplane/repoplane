@@ -1,7 +1,7 @@
-//! The HTTP surface: `/v1` for clients (admin token), `/v1/worker` for workers (a token per
-//! queue). The API never calls a forge; it only records what workers report.
+//! The HTTP surface: `/v1` for clients, behind the admin token. Asking for a reconcile or a head
+//! refresh records the run, then starts its Temporal workflow; reading a run reads Postgres. The
+//! API never calls a forge (ADR 0002).
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,21 +10,21 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use repoplane_flow::{
+    CONTROL_QUEUE, ReconcileInput, ReconcileWorkflow, RefreshHeadsInput, RefreshHeadsWorkflow,
+    workflow_id,
+};
+use repoplane_proto::api::{Connection, RunStatus};
 use repoplane_proto::api::{
     ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
     RepositoryList,
 };
-use repoplane_proto::id::{HeadRefreshId, ReconcileId, TaskId};
-use repoplane_proto::worker::{
-    Complete, Fail, HeadsAck, HeadsUpload, Heartbeat, Lease, LeaseRequest, PageAck, PageUpload,
-    Unseen, UnseenRepo, UnseenRequest,
-};
+use repoplane_proto::id::{HeadRefreshId, ReconcileId};
+use repoplane_proto::inventory::ConnectionSpec;
 use repoplane_store::{RepoFilter, Store, StoreError};
 use serde::Deserialize;
+use temporalio_client::{Client, WorkflowIdConflictPolicy, WorkflowStartOptions};
 
-/// A lease lasts this long without news from its worker.
-pub const LEASE_TTL_SECS: i64 = 60;
-const MAX_LEASE_WAIT: Duration = Duration::from_secs(30);
 const MAX_RECONCILE_WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(250);
 
@@ -32,8 +32,7 @@ const POLL: Duration = Duration::from_millis(250);
 pub struct AppState {
     pub store: Store,
     pub admin_token: Arc<String>,
-    /// queue name → token.
-    pub queue_tokens: Arc<BTreeMap<String, String>>,
+    pub temporal: Client,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -51,18 +50,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/head-refreshes/{id}", get(get_head_refresh))
         .route("/repositories", get(list_repositories));
-    let worker = Router::new()
-        .route("/lease", post(lease))
-        .route("/tasks/{id}/heartbeat", post(heartbeat))
-        .route("/tasks/{id}/pages", post(upload_page))
-        .route("/tasks/{id}/unseen", post(unseen))
-        .route("/tasks/{id}/heads", post(upload_heads))
-        .route("/tasks/{id}/complete", post(complete))
-        .route("/tasks/{id}/fail", post(fail));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
-        .nest("/v1/worker", worker)
         .nest("/v1", public)
         .with_state(state)
 }
@@ -97,9 +87,6 @@ impl From<StoreError> for ApiError {
                 ApiError::new(StatusCode::NOT_FOUND, "not_found", format!("{m} not found"))
             }
             StoreError::Conflict(m) => ApiError::new(StatusCode::CONFLICT, "conflict", m),
-            StoreError::LeaseLost => {
-                ApiError::new(StatusCode::CONFLICT, "lease_lost", e.to_string())
-            }
             StoreError::Schema { .. } => {
                 ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "schema", e.to_string())
             }
@@ -165,18 +152,6 @@ fn admin(s: &AppState, h: &HeaderMap) -> ApiResult<()> {
     }
 }
 
-/// The queue whose token the worker presented.
-fn worker_queue(s: &AppState, h: &HeaderMap) -> ApiResult<String> {
-    let t = bearer(h).ok_or_else(unauthorized)?;
-    let mut found = None;
-    for (q, token) in s.queue_tokens.iter() {
-        if same(t, token) {
-            found = Some(q.clone());
-        }
-    }
-    found.ok_or_else(unauthorized)
-}
-
 // --- public ----------------------------------------------------------------------------
 
 async fn readyz(State(s): State<AppState>) -> ApiResult<&'static str> {
@@ -190,18 +165,6 @@ async fn create_connection(
     Json(body): Json<CreateConnection>,
 ) -> ApiResult<impl IntoResponse> {
     admin(&s, &h)?;
-    if let Some(q) = &body.queue
-        && !s.queue_tokens.contains_key(q)
-    {
-        return Err(ApiError::bad(format!(
-            "queue {q:?} is not configured on this API; configured: {}",
-            s.queue_tokens
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
     let c = s.store.create_connection(&body).await?;
     Ok((StatusCode::CREATED, Json(c)))
 }
@@ -233,12 +196,68 @@ async fn request_reconcile(
     admin(&s, &h)?;
     let c = s.store.connection(&key).await?;
     let (r, created) = s.store.request_reconcile(&c).await?;
-    let status = if created {
-        StatusCode::CREATED
-    } else {
-        StatusCode::OK
+    if !created {
+        // One reconcile per connection at a time: this request joins the one in flight.
+        return Ok((StatusCode::OK, Json(r)));
+    }
+    let started = s
+        .temporal
+        .start_workflow(
+            ReconcileWorkflow::run,
+            ReconcileInput {
+                reconcile: r.id,
+                connection: spec(&c),
+            },
+            start_options(&r.id),
+        )
+        .await;
+    if let Err(e) = started {
+        return Err(not_started(&s, Run::Reconcile(r.id), e.to_string()).await);
+    }
+    Ok((StatusCode::CREATED, Json(r)))
+}
+
+/// What a workflow needs to reach the connection's forge: everything but the secret.
+fn spec(c: &Connection) -> ConnectionSpec {
+    ConnectionSpec {
+        id: c.id,
+        forge: c.forge,
+        org: c.org.clone(),
+        base_url: c.base_url.clone(),
+        token_env: c.token_env.clone(),
+        queue: c.queue.clone(),
+    }
+}
+
+/// The workflow id is the run id; starting it twice joins the first.
+fn start_options(run: &impl std::fmt::Display) -> WorkflowStartOptions {
+    WorkflowStartOptions::new(CONTROL_QUEUE, workflow_id(run))
+        .id_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
+        .build()
+}
+
+enum Run {
+    Reconcile(ReconcileId),
+    Refresh(HeadRefreshId),
+}
+
+/// Temporal would not take the workflow: the run is recorded as failed, so nothing waits on a
+/// run that will never start, and the caller hears why.
+async fn not_started(s: &AppState, run: Run, message: String) -> ApiError {
+    let message = format!("could not start the workflow: {message}");
+    let recorded = match run {
+        Run::Reconcile(id) => s.store.fail_reconcile(id, &message).await,
+        Run::Refresh(id) => s.store.fail_refresh(id, &message).await,
     };
-    Ok((status, Json(r)))
+    if let Err(e) = recorded {
+        tracing::error!(error = %e, "could not record a run that never started");
+    }
+    tracing::error!("{message}");
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporal_unavailable",
+        message,
+    )
 }
 
 #[derive(Deserialize)]
@@ -297,6 +316,23 @@ async fn request_head_refresh(
     let c = s.store.connection(&key).await?;
     let filter = body.map(|Json(b)| b).unwrap_or_default();
     let r = s.store.request_head_refresh(&c, &filter).await?;
+    // Nothing to read finishes as it is created; there is no workflow to start.
+    if r.status == RunStatus::Queued {
+        let started = s
+            .temporal
+            .start_workflow(
+                RefreshHeadsWorkflow::run,
+                RefreshHeadsInput {
+                    refresh: r.id,
+                    connection: spec(&c),
+                },
+                start_options(&r.id),
+            )
+            .await;
+        if let Err(e) = started {
+            return Err(not_started(&s, Run::Refresh(r.id), e.to_string()).await);
+        }
+    }
     Ok((StatusCode::CREATED, Json(r)))
 }
 
@@ -369,137 +405,6 @@ async fn list_repositories(
         items: page.items,
         next_cursor: page.next_cursor,
     }))
-}
-
-// --- worker ----------------------------------------------------------------------------
-
-async fn lease(
-    State(s): State<AppState>,
-    h: HeaderMap,
-    Json(req): Json<LeaseRequest>,
-) -> ApiResult<Response> {
-    let queue = worker_queue(&s, &h)?;
-    if req.queue != queue {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            format!("this token serves queue {queue:?}, not {:?}", req.queue),
-        ));
-    }
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_millis(req.wait_ms).min(MAX_LEASE_WAIT);
-    loop {
-        if let Some(l) = s.store.lease(&queue, LEASE_TTL_SECS).await? {
-            tracing::info!(task = %l.task, queue, "leased");
-            return Ok(Json(Lease {
-                task: l.task,
-                lease_id: l.lease_id,
-                ttl_secs: LEASE_TTL_SECS as u64,
-                work: l.work,
-            })
-            .into_response());
-        }
-        if tokio::time::Instant::now() + POLL > deadline {
-            return Ok(StatusCode::NO_CONTENT.into_response());
-        }
-        tokio::time::sleep(POLL).await;
-    }
-}
-
-fn task_id(id: &str) -> ApiResult<TaskId> {
-    id.parse()
-        .map_err(|e: repoplane_proto::id::IdError| ApiError::bad(e.to_string()))
-}
-
-async fn heartbeat(
-    State(s): State<AppState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(b): Json<Heartbeat>,
-) -> ApiResult<StatusCode> {
-    worker_queue(&s, &h)?;
-    s.store
-        .heartbeat(task_id(&id)?, b.lease_id, LEASE_TTL_SECS)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn upload_page(
-    State(s): State<AppState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(b): Json<PageUpload>,
-) -> ApiResult<Json<PageAck>> {
-    worker_queue(&s, &h)?;
-    let out = s
-        .store
-        .upload_page(task_id(&id)?, b.lease_id, LEASE_TTL_SECS, &b.repos)
-        .await?;
-    Ok(Json(PageAck {
-        recorded: out.recorded,
-    }))
-}
-
-async fn upload_heads(
-    State(s): State<AppState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(b): Json<HeadsUpload>,
-) -> ApiResult<Json<HeadsAck>> {
-    worker_queue(&s, &h)?;
-    let changed = s
-        .store
-        .upload_heads(task_id(&id)?, b.lease_id, LEASE_TTL_SECS, &b.heads)
-        .await?;
-    Ok(Json(HeadsAck { changed }))
-}
-
-async fn unseen(
-    State(s): State<AppState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(b): Json<UnseenRequest>,
-) -> ApiResult<Json<Unseen>> {
-    worker_queue(&s, &h)?;
-    let rows = s
-        .store
-        .unseen(task_id(&id)?, b.lease_id, LEASE_TTL_SECS)
-        .await?;
-    Ok(Json(Unseen {
-        repos: rows
-            .into_iter()
-            .map(|(external_id, full_name)| UnseenRepo {
-                external_id,
-                full_name,
-            })
-            .collect(),
-    }))
-}
-
-async fn complete(
-    State(s): State<AppState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(b): Json<Complete>,
-) -> ApiResult<StatusCode> {
-    worker_queue(&s, &h)?;
-    s.store
-        .complete(task_id(&id)?, b.lease_id, b.complete_listing)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn fail(
-    State(s): State<AppState>,
-    h: HeaderMap,
-    Path(id): Path<String>,
-    Json(b): Json<Fail>,
-) -> ApiResult<StatusCode> {
-    worker_queue(&s, &h)?;
-    s.store
-        .fail(task_id(&id)?, b.lease_id, &b.message, b.retryable)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

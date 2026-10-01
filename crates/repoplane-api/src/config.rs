@@ -1,10 +1,10 @@
 //! `repoplane-api.yaml`. Like forgelab's `sandboxes.yaml`, it names secrets and never holds
 //! them: every credential is the NAME of an environment variable.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, bail};
+use repoplane_flow::TemporalConfig;
 use repoplane_proto::secret;
 use serde::Deserialize;
 
@@ -17,9 +17,8 @@ pub struct Config {
     pub database_url_env: String,
     #[serde(default)]
     pub admin: Admin,
-    /// Task queues and the token a worker presents to serve each.
-    #[serde(default = "default_queues")]
-    pub queues: BTreeMap<String, Queue>,
+    #[serde(default)]
+    pub temporal: TemporalConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,12 +35,6 @@ impl Default for Admin {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Queue {
-    pub token_env: String,
-}
-
 fn default_listen() -> String {
     "127.0.0.1:8080".into()
 }
@@ -50,22 +43,13 @@ fn default_database_url_env() -> String {
     "REPOPLANE_DATABASE_URL".into()
 }
 
-fn default_queues() -> BTreeMap<String, Queue> {
-    BTreeMap::from([(
-        "default".to_string(),
-        Queue {
-            token_env: "REPOPLANE_WORKER_TOKEN".into(),
-        },
-    )])
-}
-
 impl Default for Config {
     fn default() -> Self {
         Config {
             listen: default_listen(),
             database_url_env: default_database_url_env(),
             admin: Admin::default(),
-            queues: default_queues(),
+            temporal: TemporalConfig::default(),
         }
     }
 }
@@ -85,21 +69,15 @@ impl Config {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        let mut names = vec![
+        for (field, v) in [
             ("database_url_env", &self.database_url_env),
             ("admin.token_env", &self.admin.token_env),
-        ];
-        for q in self.queues.values() {
-            names.push(("queues.*.token_env", &q.token_env));
-        }
-        for (field, v) in names {
+        ] {
             if !secret::valid_env_name(v) {
                 bail!(secret::describe_env_name_error(field, v));
             }
         }
-        if self.queues.is_empty() {
-            bail!("queues: at least one queue is needed for a worker to serve");
-        }
+        self.temporal.validate()?;
         Ok(())
     }
 }
@@ -119,7 +97,8 @@ mod tests {
     #[test]
     fn defaults_and_strictness() {
         let c: Config = serde_yaml_ng::from_str("listen: 0.0.0.0:9000").unwrap();
-        assert_eq!(c.queues["default"].token_env, "REPOPLANE_WORKER_TOKEN");
+        assert_eq!(c.temporal.address, "http://localhost:7233");
+        assert_eq!(c.temporal.namespace, "default");
         assert!(serde_yaml_ng::from_str::<Config>("lisen: x").is_err());
         let bad: Config =
             serde_yaml_ng::from_str("admin: {token_env: ghp_0123456789abcdefABCDEF0123456789abcd}")

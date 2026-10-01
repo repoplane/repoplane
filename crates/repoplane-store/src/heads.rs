@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use repoplane_proto::api::{Connection, HeadRefresh, RefreshHeads};
-use repoplane_proto::id::{ConnectionId, HeadRefreshId, TaskId};
+use repoplane_proto::id::{ConnectionId, HeadRefreshId};
 use uuid::Uuid;
 
 use crate::{Result, Store, StoreError, parse_status};
@@ -83,25 +83,14 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         } else {
-            let task = TaskId::new();
-            sqlx::query(
-                "insert into tasks (id, organization_id, queue, kind, state)
-                 values ($1, $2, $3, 'refresh_heads', 'queued')",
-            )
-            .bind(task.uuid())
-            .bind(self.org.uuid())
-            .bind(&connection.queue)
-            .execute(&mut *tx)
-            .await?;
             sqlx::query(
                 "insert into head_refreshes
-                     (id, organization_id, connection_id, task_id, status, targets, targeted)
-                 values ($1, $2, $3, $4, 'queued', $5, $6)",
+                     (id, organization_id, connection_id, status, targets, targeted)
+                 values ($1, $2, $3, 'queued', $4, $5)",
             )
             .bind(id.uuid())
             .bind(self.org.uuid())
             .bind(connection.id.uuid())
-            .bind(task.uuid())
             .bind(&targets)
             .bind(targets.len() as i64)
             .execute(&mut *tx)

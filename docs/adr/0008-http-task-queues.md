@@ -1,6 +1,8 @@
 # 8. Worker ↔ API is HTTPS long-poll task queues, not Temporal
 
-**Status:** New · 2026-09-30
+> **Superseded.** This was a mistake: it replaced Temporal on the belief that its Rust SDK was immature. Temporal orchestrates every run (ADR 0012).
+
+**Status:** Superseded by [0012](0012-temporal-orchestrates.md) · 2026-10-01
 
 ## Context
 

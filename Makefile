@@ -21,16 +21,17 @@ lint: boundaries
 	cargo clippy --workspace --all-targets -- -D warnings
 
 # The audit claim, checked rather than asserted: the component that holds the database cannot
-# reach a forge, the one that reaches forges cannot reach the database, and the CLI reaches
-# neither. See docs/adr/0001 and 0002.
+# reach a forge, the one that reaches forges cannot reach the database, the workflows touch
+# neither, and the CLI is only an HTTP client. See docs/adr/0001, 0002 and 0012.
 ## Check that no binary links what its role forbids
 boundaries:
 	@fail=0; \
-	check() { if cargo tree -p $$1 -e normal --prefix none | grep -qE "^($$2) "; then echo "boundary: $$1 links $$2"; fail=1; fi; }; \
-	check repoplane-cli    'sqlx|repoplane-store|repoplane-forge'; \
+	check() { if cargo tree -p $$1 -e normal --prefix none | grep -qE "^($$2) "; then echo "boundary: $$1 links one of $$2"; fail=1; fi; }; \
+	check repoplane-cli    'sqlx|repoplane-store|repoplane-forge|repoplane-flow|temporalio-[a-z-]+'; \
 	check repoplane-worker 'sqlx|repoplane-store'; \
 	check repoplane-api    'repoplane-forge|reqwest'; \
-	check repoplane-proto  'sqlx|reqwest|repoplane-forge|repoplane-store'; \
+	check repoplane-flow   'sqlx|repoplane-store|repoplane-forge|reqwest'; \
+	check repoplane-proto  'sqlx|reqwest|repoplane-forge|repoplane-store|temporalio-[a-z-]+'; \
 	exit $$fail
 	@echo "boundaries: ok"
 
@@ -38,9 +39,9 @@ boundaries:
 unit:
 	cargo test --workspace --exclude repoplane-e2e
 
-## The queue against a real Postgres: races and retries no e2e run can hit on purpose (Docker)
+## The run steps against a real Postgres: races and repeats no e2e run can hit on purpose (Docker)
 db:
-	REPOPLANE_DB_TESTS=1 cargo test -p repoplane-store --test queue
+	REPOPLANE_DB_TESTS=1 cargo test -p repoplane-store --test runs
 
 ## End-to-end on one fleets sandbox: SANDBOX=local (Docker) | gh | gl | ado (tokens: source ../fleets/.env)
 e2e: build
@@ -54,7 +55,7 @@ e2e-all: build
 ci: lint unit db
 	$(MAKE) e2e SANDBOX=local
 
-## Postgres + a local Forgejo for trying the CLI by hand (see README)
+## Postgres, Temporal and a local Forgejo for trying repoplane by hand (see README)
 up:
 	docker compose up -d --wait
 

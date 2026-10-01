@@ -1,6 +1,6 @@
 # 1. The worker cannot reach the database
 
-**Status:** Kept (carried over from the Go draft) · 2026-09-30
+**Status:** Kept; mechanism rewritten for Temporal · 2026-10-01
 
 ## Context
 
@@ -9,8 +9,10 @@ customer runs inside its own network, possibly far from the API (the hybrid depl
 
 ## Decision
 
-The worker has no database driver and no database credential. Everything it learns goes
-through `/v1/worker` on the API.
+The worker has no database driver and no database credential. It runs the forge activities and
+returns what it found to Temporal; the workflows hand that to the Postgres activities, which run
+in `repoplane-api`. The worker no longer talks to the repoplane API either: its only peers are
+Temporal and the forges.
 
 ## Consequences
 

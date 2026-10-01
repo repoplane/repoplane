@@ -18,6 +18,9 @@ path = "e2e.rs"
 [dependencies]
 repoplane-proto.workspace = true
 repoplane-forge.workspace = true
+repoplane-flow.workspace = true
+temporalio-client.workspace = true
+temporalio-common.workspace = true
 tokio-util.workspace = true
 anyhow.workspace = true
 axum.workspace = true

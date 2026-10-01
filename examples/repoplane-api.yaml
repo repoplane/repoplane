@@ -4,8 +4,7 @@ listen: 127.0.0.1:8080
 database_url_env: REPOPLANE_DATABASE_URL   # postgres://user:password@host:5432/db
 admin:
   token_env: REPOPLANE_ADMIN_TOKEN         # the CLI's and the enterprise plane's bearer token
-queues:
-  default:
-    token_env: REPOPLANE_WORKER_TOKEN      # presented by workers serving this queue
-  # bank-eu:                               # a queue served only by workers inside one network
-  #   token_env: REPOPLANE_BANK_EU_TOKEN
+temporal:
+  address: http://localhost:7233           # Temporal Cloud: https://<ns>.<account>.tmprl.cloud:7233
+  namespace: default
+  # api_key_env: TEMPORAL_API_KEY          # Temporal Cloud; turns TLS on

@@ -1,6 +1,19 @@
-# Postgres for the API, and a Forgejo to point a connection at, for trying repoplane by hand.
-# The e2e suite starts its own of both through testcontainers.
+# Postgres for the API, Temporal for the workflows, and a Forgejo to point a connection at, for
+# trying repoplane by hand. The e2e suite starts its own of each through testcontainers.
 services:
+  temporal:
+    # The Temporal CLI's dev server (CLI 1.9.1): in-memory, for development only. The UI is on
+    # :8233. In production, point temporal.address at a Temporal cluster or Temporal Cloud.
+    image: temporalio/temporal@sha256:ad4c82c97bd12b417d1ea942610dbcd511afb250c4d5ed26c694009533df447e
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--ui-ip", "0.0.0.0"]
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 2s
+      retries: 30
+
   postgres:
     image: postgres:18-alpine
     environment:

@@ -1,0 +1,23 @@
+[package]
+name = "repoplane-flow"
+description = "Repoplane's Temporal workflows, and the activity definitions the API and the worker implement."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+repoplane-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+temporalio-sdk.workspace = true
+temporalio-client.workspace = true
+temporalio-macros.workspace = true
+temporalio-common.workspace = true
+temporalio-workflow.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

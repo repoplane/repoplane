@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use repoplane_forge::{ReqwestTransport, lister};
 use repoplane_proto::id::ConnectionId;
-use repoplane_proto::worker::ConnectionSpec;
+use repoplane_proto::inventory::ConnectionSpec;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
@@ -26,6 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         org: org.clone(),
         base_url: base_url.trim_end_matches('/').to_string(),
         token_env: token_env.clone(),
+        queue: "default".into(),
     };
     let l = lister(&spec, ReqwestTransport::new()?, CancellationToken::new())?;
     let started = std::time::Instant::now();

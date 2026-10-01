@@ -1,6 +1,6 @@
 # 3. The API holds no forge credential
 
-**Status:** Kept, to revisit with GitHub Apps · 2026-09-30
+**Status:** Kept, to revisit with GitHub Apps; extended to workflow history · 2026-10-01
 
 ## Context
 
@@ -19,3 +19,8 @@ inbound-only webhook secret.
 
 The token never crosses the API, a log or an error: the worker's HTTP layer scrubs it (and its
 base64 forms) from every message it reports.
+
+**No secret enters workflow history either** (ADR 0012). Workflow inputs and activity results are
+stored by Temporal. A connection travels in them as its token's *variable name*, and the forge
+activity reads the token itself, in the worker. Decoding the recorded histories in
+`crates/repoplane-flow/tests/histories` shows only variable names.

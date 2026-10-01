@@ -196,12 +196,13 @@ impl ForgeSide {
 
     /// A repoplane forge client for this sandbox, for checking an adapter directly.
     pub fn lister(&self) -> anyhow::Result<Box<dyn repoplane_forge::Lister>> {
-        let spec = repoplane_proto::worker::ConnectionSpec {
+        let spec = repoplane_proto::inventory::ConnectionSpec {
             id: repoplane_proto::id::ConnectionId::new(),
             forge: self.forge,
             org: self.org.clone(),
             base_url: self.base_url.clone(),
             token_env: self.token_env.clone(),
+            queue: "default".into(),
         };
         Ok(repoplane_forge::lister_with_token(
             &spec,
@@ -415,9 +416,46 @@ pub struct Stack {
     admin_token: String,
     bin: PathBuf,
     pub logs: PathBuf,
+    /// The Temporal frontend, as `http://127.0.0.1:<port>`.
+    pub temporal: String,
+    forge_token: (String, String),
     _api: Child,
-    _worker: Child,
+    worker: tokio::sync::Mutex<Option<Child>>,
+    _temporal: ContainerAsync<GenericImage>,
     _pg: ContainerAsync<GenericImage>,
+}
+
+/// The Temporal CLI's dev server, the version of the local `temporal`, pinned by digest.
+const TEMPORAL_IMAGE: &str = "temporalio/temporal@sha256";
+const TEMPORAL_DIGEST: &str = "ad4c82c97bd12b417d1ea942610dbcd511afb250c4d5ed26c694009533df447e";
+
+/// A Temporal dev server, answering once its frontend reports SERVING.
+async fn start_temporal() -> anyhow::Result<(ContainerAsync<GenericImage>, String)> {
+    let c = GenericImage::new(TEMPORAL_IMAGE, TEMPORAL_DIGEST)
+        .with_exposed_port(7233.tcp())
+        .with_cmd(["server", "start-dev", "--ip", "0.0.0.0", "--headless"])
+        .start()
+        .await
+        .context("start Temporal")?;
+    let port = c.get_host_port_ipv4(7233.tcp()).await?;
+    for _ in 0..120 {
+        let mut res = c
+            .exec(ExecCommand::new([
+                "temporal",
+                "operator",
+                "cluster",
+                "health",
+                "--address",
+                "127.0.0.1:7233",
+            ]))
+            .await?;
+        let out = String::from_utf8_lossy(&res.stdout_to_vec().await?).to_string();
+        if out.contains("SERVING") {
+            return Ok((c, format!("http://127.0.0.1:{port}")));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    bail!("Temporal never reported SERVING")
 }
 
 fn bin_dir() -> PathBuf {
@@ -455,8 +493,8 @@ impl Stack {
             .map(str::to_string)
     }
 
-    /// Postgres in a container; the API and the worker as real processes, the worker with the
-    /// forge token in its environment and the API without it.
+    /// Postgres and Temporal in containers; the API and the worker as real processes, the
+    /// worker with the forge token in its environment and the API without it.
     pub async fn start(forge_token: (String, String)) -> anyhow::Result<Stack> {
         let bin = bin_dir();
         for b in ["repoplane-api", "repoplane-worker", "repoplane"] {
@@ -479,10 +517,10 @@ impl Stack {
             .await
             .context("start Postgres")?;
         let pg_port = pg.get_host_port_ipv4(5432.tcp()).await?;
+        let (temporal_container, temporal) = start_temporal().await?;
         let db_url =
             format!("postgres://repoplane:repoplane-not-a-secret@127.0.0.1:{pg_port}/repoplane");
         let admin_token = format!("admin-{}", uuid_like());
-        let worker_token = format!("worker-{}", uuid_like());
         let port = free_port()?;
         let api_url = format!("http://127.0.0.1:{port}");
         let logs = workspace_root().join("target/e2e-logs");
@@ -494,7 +532,6 @@ impl Stack {
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("REPOPLANE_DATABASE_URL", &db_url)
                 .env("REPOPLANE_ADMIN_TOKEN", &admin_token)
-                .env("REPOPLANE_WORKER_TOKEN", &worker_token)
                 .env("RUST_LOG", "info,sqlx=warn")
                 .current_dir(cfg_dir.path());
         };
@@ -520,7 +557,7 @@ impl Stack {
         }
         std::fs::write(
             cfg_dir.path().join("repoplane-api.yaml"),
-            format!("listen: 127.0.0.1:{port}\n"),
+            format!("listen: 127.0.0.1:{port}\ntemporal:\n  address: {temporal}\n"),
         )?;
         let mut api = Command::new(bin.join("repoplane-api"));
         api_env(&mut api);
@@ -552,29 +589,66 @@ impl Stack {
             );
         }
 
-        let worker = Command::new(bin.join("repoplane-worker"))
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("REPOPLANE_WORKER_TOKEN", &worker_token)
-            .env(&forge_token.0, &forge_token.1)
-            .env("RUST_LOG", "info")
-            .args(["--api-url", &api_url])
-            .current_dir(cfg_dir.path())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(logs.join("worker.log"))?)
-            .kill_on_drop(true)
-            .spawn()?;
-        // The config directory must outlive the processes' start only.
+        // The config directory must outlive the API's start only.
         drop(cfg_dir);
-        Ok(Stack {
+        let stack = Stack {
             api_url,
             admin_token,
             bin,
             logs,
+            temporal,
+            forge_token,
             _api: api,
-            _worker: worker,
+            worker: tokio::sync::Mutex::new(None),
+            _temporal: temporal_container,
             _pg: pg,
-        })
+        };
+        std::fs::File::create(stack.logs.join("worker.log"))?;
+        stack.start_worker().await?;
+        Ok(stack)
+    }
+
+    /// A finished workflow's history as JSON, for the replay tests in repoplane-flow.
+    pub async fn history_json<W: temporalio_common::HasWorkflowDefinition>(
+        &self,
+        workflow_id: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let client = repoplane_flow::TemporalConfig {
+            address: self.temporal.clone(),
+            ..Default::default()
+        }
+        .connect("repoplane-e2e")
+        .await?;
+        let handle = client.get_workflow_handle::<W>(workflow_id);
+        Ok(handle.fetch_history(Default::default()).to_json().await?)
+    }
+
+    /// Starts the worker: the forge token in its environment, Temporal as its only peer.
+    pub async fn start_worker(&self) -> anyhow::Result<()> {
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.logs.join("worker.log"))?;
+        let mut worker = std::process::Command::new(self.bin.join("repoplane-worker"));
+        worker
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env(&self.forge_token.0, &self.forge_token.1)
+            .env("RUST_LOG", "info")
+            .args(["--temporal-address", &self.temporal])
+            .stdout(Stdio::null())
+            .stderr(log);
+        let mut cmd = Command::from(worker);
+        *self.worker.lock().await = Some(cmd.kill_on_drop(true).spawn()?);
+        Ok(())
+    }
+
+    /// Stops the worker the way a crash would: no chance to finish anything.
+    pub async fn kill_worker(&self) -> anyhow::Result<()> {
+        if let Some(mut w) = self.worker.lock().await.take() {
+            w.kill().await?;
+        }
+        Ok(())
     }
 
     /// Runs the CLI; its stdout on success, its stderr as the error otherwise.
@@ -759,19 +833,31 @@ pub fn compare(
 
 // --- a forge that shifts under a listing ---------------------------------------------------
 
-/// A proxy in front of Forgejo that deletes a repository from page 1 of the organisation
-/// listing the moment page 2 is asked for, so every later page shifts back by one and the
-/// listing skips a repository that still exists: the race ADR 0005 guards against, made
-/// deterministic.
-pub struct ShiftingProxy {
+/// A proxy in front of Forgejo that misbehaves on demand, on the organisation listing only:
+///
+/// - **shift** (`arm`): deletes a repository from page 1 the moment page 2 is asked for, so
+///   every later page shifts back by one and the listing skips a repository that still exists —
+///   the race ADR 0005 guards against, made deterministic;
+/// - **rate limit** (`rate_limit_next`): answers 429 with a `Retry-After` longer than a forge
+///   call's budget, which the activity reports as retryable and Temporal retries;
+/// - **refuse** (`refuse_token`): answers 401, which no retry will fix.
+pub struct ForgeProxy {
     pub base_url: String,
     /// The repository deleted, once it has been.
     pub deleted: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    faults: Faults,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for ShiftingProxy {
+#[derive(Clone, Default)]
+struct Faults {
+    rate_limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    rate_limited: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    refuse: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for ForgeProxy {
     fn drop(&mut self) {
         self.task.abort();
     }
@@ -786,14 +872,16 @@ struct ProxyState {
     page_one: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     deleted: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    faults: Faults,
 }
 
-impl ShiftingProxy {
-    pub async fn start(side: &ForgeSide) -> anyhow::Result<ShiftingProxy> {
+impl ForgeProxy {
+    pub async fn start(side: &ForgeSide) -> anyhow::Result<ForgeProxy> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("http://{}", listener.local_addr()?);
         let deleted = std::sync::Arc::new(std::sync::Mutex::new(None));
         let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let faults = Faults::default();
         let state = ProxyState {
             upstream: side.base_url.clone(),
             listing: format!("/api/v1/orgs/{}/repos", side.org),
@@ -802,17 +890,40 @@ impl ShiftingProxy {
             page_one: Default::default(),
             deleted: deleted.clone(),
             armed: armed.clone(),
+            faults: faults.clone(),
         };
         let app = axum::Router::new().fallback(forward).with_state(state);
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Ok(ShiftingProxy {
+        Ok(ForgeProxy {
             base_url,
             deleted,
             armed,
+            faults,
             task,
         })
+    }
+
+    /// The next `n` listing requests are answered 429, asking for an hour.
+    pub fn rate_limit_next(&self, n: usize) {
+        self.faults
+            .rate_limit
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many listing requests were answered 429 so far.
+    pub fn rate_limited(&self) -> usize {
+        self.faults
+            .rate_limited
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// While on, every listing request is answered 401.
+    pub fn refuse_token(&self, on: bool) {
+        self.faults
+            .refuse
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// From now on, the next listing that reaches page 2 shifts.
@@ -839,7 +950,29 @@ async fn forward(
         .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("page=")))
         .unwrap_or("1")
         .to_string();
-    if listing && page == "2" && s.armed.load(std::sync::atomic::Ordering::SeqCst) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if listing && s.faults.refuse.load(SeqCst) {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            r#"{"message":"token is required"}"#,
+        )
+            .into_response();
+    }
+    if listing
+        && s.faults
+            .rate_limit
+            .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    {
+        s.faults.rate_limited.fetch_add(1, SeqCst);
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "3600")],
+            r#"{"message":"rate limited"}"#,
+        )
+            .into_response();
+    }
+    if listing && page == "2" && s.armed.load(SeqCst) {
         let victim = s.page_one.lock().unwrap().first().cloned();
         let first_time = s.deleted.lock().unwrap().is_none();
         if let (Some(victim), true) = (victim, first_time) {

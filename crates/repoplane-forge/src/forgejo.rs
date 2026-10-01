@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use http::HeaderMap;
 use repoplane_proto::ForgeKind;
-use repoplane_proto::worker::RepoSnapshot;
+use repoplane_proto::inventory::RepoSnapshot;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 

@@ -50,19 +50,21 @@ Two operations, each doing one thing:
 
 ## How it is built
 
-Three open-source binaries. Whoever runs them can audit every line that touches their code and
-their credentials:
+Three open-source binaries, orchestrated by [Temporal](https://temporal.io). Whoever runs them can
+audit every line that touches their code and their credentials:
 
 | Binary | Role |
 |---|---|
 | `repoplane` | the CLI: a client of the API, and nothing else |
-| `repoplane-api` | owns Postgres; serves `/v1` and the worker task queues; never calls a forge |
-| `repoplane-worker` | leases tasks over outbound HTTPS and talks to the forges; holds the forge tokens; never opens a database |
+| `repoplane-api` | owns Postgres, serves `/v1`, and runs the workflows and their Postgres steps as a Temporal worker; never calls a forge |
+| `repoplane-worker` | runs the forge steps as a Temporal worker on its queue; holds the forge tokens; talks only to Temporal and forges; never opens a database |
 
-Workers poll task queues the way Temporal workers do. So the API and the workers can run
-together, all inside one network, or apart: a hosted API with workers inside the customer's
-network, where tokens and source code never leave it. The C4 views and the rules are in
-[`docs/architecture.md`](docs/architecture.md), and the decisions in [`docs/adr`](docs/adr).
+A reconcile and a head refresh are each a Temporal workflow. They retry with backoff, survive a
+process dying, and leave room for what comes next: waiting days for a merge, waves, signals.
+Because workers only poll Temporal, they can run inside a customer's network against a hosted
+API and Temporal, and tokens and source code never leave that network. The C4 views and the
+rules are in [`docs/architecture.md`](docs/architecture.md), and the decisions in
+[`docs/adr`](docs/adr).
 
 | Forge | `--org` is | Notes |
 |---|---|---|
@@ -76,9 +78,9 @@ network, where tokens and source code never leave it. The C4 views and the rules
 Needs Rust 1.93+ and Docker.
 
 ```sh
-make up build                  # Postgres on :5432 and a Forgejo on :3000; the three binaries
+make up build                  # Postgres :5432, Temporal :7233 (UI :8233), Forgejo :3000; the three binaries
 export REPOPLANE_DATABASE_URL=postgres://repoplane:repoplane-not-a-secret@127.0.0.1:5432/repoplane
-export REPOPLANE_ADMIN_TOKEN=dev-admin REPOPLANE_TOKEN=dev-admin REPOPLANE_WORKER_TOKEN=dev-worker
+export REPOPLANE_ADMIN_TOKEN=dev-admin REPOPLANE_TOKEN=dev-admin
 
 target/debug/repoplane-api migrate
 target/debug/repoplane-api serve &
@@ -87,13 +89,17 @@ FORGEJO_TOKEN=… target/debug/repoplane-worker &
 target/debug/repoplane connection add forgejo --name lab --org <your-org> \
   --auth token --token-env FORGEJO_TOKEN --base-url http://localhost:3000
 target/debug/repoplane connection reconcile lab --wait
+target/debug/repoplane repo refresh-heads --connection lab --wait
 target/debug/repoplane repo list
 ```
+
+Each run is visible in the Temporal UI at <http://localhost:8233>, its workflow id being the run's
+id (`rec_…`, `hrf_…`).
 
 ## Secrets are named, never written
 
 Every credential is configured by the *name* of an environment variable: the API's database
-URL, admin and queue tokens ([`examples/repoplane-api.yaml`](examples/repoplane-api.yaml)); a
+URL, admin token and Temporal Cloud API key ([`examples/repoplane-api.yaml`](examples/repoplane-api.yaml)); a
 connection's forge token (`--token-env`, read only by the worker); the CLI's API token
 ([`examples/contexts.yaml`](examples/contexts.yaml)). No flag takes a secret, and one pasted
 where a name belongs is refused.
@@ -103,13 +109,14 @@ where a name belongs is refused.
 ```sh
 make lint       # fmt, clippy, and the component boundaries (make boundaries)
 make unit       # unit tests: no Docker, no network
-make db         # the task queue against a real Postgres (Docker)
+make db         # the run steps against a real Postgres (Docker)
 make e2e        # end-to-end on a local Forgejo (Docker)
 make e2e SANDBOX=gh|gl|ado    # on a real sandbox: source ../fleets/.env first
 make e2e-all    # all four
 ```
 
-The end-to-end suite runs the real binaries against the
+The end-to-end suite runs the real binaries, with Postgres and a Temporal dev server in
+containers, against the
 [fleets](https://github.com/repoplane/fleets) sandboxes. It mutates each sandbox (a topic, a
 pushed commit, an archive, a deletion on local), checks that reconcile records exactly that, and
 puts the sandbox back with [forgelab](https://github.com/repoplane/forgelab) after every

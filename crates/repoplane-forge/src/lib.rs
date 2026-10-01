@@ -19,7 +19,7 @@ pub mod token;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use repoplane_proto::worker::{ConnectionSpec, RepoSnapshot};
+use repoplane_proto::inventory::{ConnectionSpec, RepoSnapshot};
 use repoplane_proto::{Caps, ForgeKind};
 use tokio_util::sync::CancellationToken;
 

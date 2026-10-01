@@ -1,25 +1,22 @@
-//! `repoplane-worker`: leases tasks from the API over outbound HTTPS and talks to forges. It
-//! holds the forge tokens (read from the variables each connection names) and never opens a
-//! database or accepts a connection (ADR 0001, 0003, 0008).
+//! `repoplane-worker`: a Temporal activity worker for the forge activities, on one queue. It
+//! holds the forge tokens (read from the variables each connection names), and talks only to
+//! Temporal and to forges: no database, no repoplane API, no inbound connection (ADR 0001).
 
-mod api;
 #[cfg(test)]
 mod fake;
-mod heads;
-mod reconcile;
-mod task;
+// The activity macro also generates call markers for workflows, which this binary never names.
+#[allow(dead_code)]
+mod forge;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::Parser;
+use repoplane_flow::TemporalConfig;
 use repoplane_forge::ReqwestTransport;
-use repoplane_proto::secret;
 use serde::Deserialize;
-use tokio::task::JoinSet;
-use tokio_util::sync::CancellationToken;
+use temporalio_sdk::runtime::worker_tuner::{FixedSizeSlotSupplier, TunerHolder};
+use temporalio_sdk::{Runtime, Worker, WorkerOptions};
 
 #[derive(Parser)]
 #[command(name = "repoplane-worker", version, about = "The repoplane worker")]
@@ -27,43 +24,32 @@ struct Cli {
     /// The configuration file; without one, defaults and flags apply.
     #[arg(long, default_value = "repoplane-worker.yaml")]
     config: PathBuf,
-    /// Overrides `api_url`.
-    #[arg(long)]
-    api_url: Option<String>,
     /// Overrides `queue`.
     #[arg(long)]
     queue: Option<String>,
-    /// Overrides `concurrency`.
+    /// Overrides `temporal.address`.
     #[arg(long)]
-    concurrency: Option<usize>,
+    temporal_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
-    #[serde(default = "default_api_url")]
-    api_url: String,
+    /// The task queue this worker serves: the `queue` of the connections it runs for.
     #[serde(default = "default_queue")]
     queue: String,
-    /// The NAME of the variable holding this worker's token for its queue.
-    #[serde(default = "default_token_env")]
-    token_env: String,
-    /// Tasks run at once.
+    /// Forge activities run at once.
     #[serde(default = "default_concurrency")]
     concurrency: usize,
+    #[serde(default)]
+    temporal: TemporalConfig,
 }
 
-fn default_api_url() -> String {
-    "http://127.0.0.1:8080".into()
-}
 fn default_queue() -> String {
     "default".into()
 }
-fn default_token_env() -> String {
-    "REPOPLANE_WORKER_TOKEN".into()
-}
 fn default_concurrency() -> usize {
-    4
+    8
 }
 
 fn load(cli: &Cli) -> anyhow::Result<Config> {
@@ -76,21 +62,16 @@ fn load(cli: &Cli) -> anyhow::Result<Config> {
         }
         Err(e) => return Err(e).with_context(|| format!("read {}", cli.config.display())),
     };
-    if let Some(u) = &cli.api_url {
-        cfg.api_url = u.clone();
-    }
     if let Some(q) = &cli.queue {
         cfg.queue = q.clone();
     }
-    if let Some(c) = cli.concurrency {
-        cfg.concurrency = c;
-    }
-    if !secret::valid_env_name(&cfg.token_env) {
-        bail!(secret::describe_env_name_error("token_env", &cfg.token_env));
+    if let Some(a) = &cli.temporal_address {
+        cfg.temporal.address = a.clone();
     }
     if cfg.concurrency == 0 {
         bail!("concurrency must be at least 1");
     }
+    cfg.temporal.validate()?;
     Ok(cfg)
 }
 
@@ -104,52 +85,41 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     let cfg = load(&cli)?;
-    let token = match std::env::var(&cfg.token_env) {
-        Ok(t) if !t.is_empty() => t,
-        _ => bail!("the environment variable {} is not set", cfg.token_env),
-    };
-    let api = Arc::new(api::Api::new(&cfg.api_url, &token)?);
-    let transport = ReqwestTransport::new()?;
-    let cancel = CancellationToken::new();
-    {
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
+    let identity = format!(
+        "repoplane-worker@{}",
+        std::env::var("HOSTNAME").unwrap_or_else(|_| std::process::id().to_string())
+    );
+    let client = cfg.temporal.connect(&identity).await?;
+    let runtime = Runtime::from_current_tokio(Default::default())
+        .map_err(|e| anyhow::anyhow!("temporal runtime: {e}"))?;
+    let tuner = TunerHolder::builder()
+        .workflow_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+        .activity_task_slot_supplier(FixedSizeSlotSupplier::new(cfg.concurrency))
+        .local_activity_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+        .nexus_task_slot_supplier(FixedSizeSlotSupplier::new(1))
+        .build();
+    let mut worker = Worker::new(
+        &runtime,
+        client,
+        WorkerOptions::new(cfg.queue.clone())
+            .register_activities(forge::ForgeActivities {
+                transport: ReqwestTransport::new()?,
+            })
+            .tuner(tuner)
+            .build(),
+    )
+    .map_err(|e| anyhow::anyhow!("temporal worker: {e}"))?;
+    let stop = worker.shutdown_handle();
+    tracing::info!(queue = %cfg.queue, temporal = %cfg.temporal.address, concurrency = cfg.concurrency, "worker started");
+    let (_, ran) = tokio::join!(
+        async {
             shutdown().await;
-            tracing::info!("shutting down: no new leases, cancelling tasks in flight");
-            cancel.cancel();
-        });
-    }
-    tracing::info!(api = %cfg.api_url, queue = %cfg.queue, concurrency = cfg.concurrency, "worker started");
-
-    let mut running = JoinSet::new();
-    let mut backoff = Duration::from_millis(500);
-    while !cancel.is_cancelled() {
-        while running.len() >= cfg.concurrency {
-            running.join_next().await;
-        }
-        let leased = tokio::select! {
-            r = api.lease(&cfg.queue, Duration::from_secs(20)) => r,
-            _ = cancel.cancelled() => break,
-        };
-        match leased {
-            Ok(Some(lease)) => {
-                backoff = Duration::from_millis(500);
-                let (api, transport, cancel) = (api.clone(), transport.clone(), cancel.clone());
-                running.spawn(async move { task::run(api, transport, lease, cancel).await });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!("lease failed, retrying in {}ms: {e:#}", backoff.as_millis());
-                tokio::select! {
-                    _ = tokio::time::sleep(backoff) => {},
-                    _ = cancel.cancelled() => break,
-                }
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-            }
-        }
-    }
-    while running.join_next().await.is_some() {}
-    Ok(())
+            tracing::info!("shutting down: finishing the activities in flight");
+            stop();
+        },
+        worker.run()
+    );
+    ran.map_err(|e| anyhow::anyhow!("temporal worker: {e}"))
 }
 
 async fn shutdown() {

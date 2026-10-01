@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use forgelab::forge::Settings;
-use repoplane_e2e::{ForgeSide, MARKER_TOPIC, ShiftingProxy, Stack, compare, expected, sandbox};
+use repoplane_e2e::{ForgeProxy, ForgeSide, MARKER_TOPIC, Stack, compare, expected, sandbox};
 use repoplane_proto::ForgeKind;
 use repoplane_proto::api::RepositoryStatus;
 
@@ -77,6 +77,21 @@ async fn inventory() {
             true,
             Box::pin(shifting_listing(&s)),
         ),
+        (
+            "the run survives its worker dying",
+            false,
+            Box::pin(worker_killed(&s)),
+        ),
+        (
+            "temporal retries a rate-limited forge call",
+            true,
+            Box::pin(rate_limited(&s)),
+        ),
+        (
+            "a refused token fails the run fast",
+            false,
+            Box::pin(refused(&s)),
+        ),
         ("topic changed", true, Box::pin(topic_changed(&s))),
         ("commit pushed", true, Box::pin(commit_pushed(&s))),
         ("archived", true, Box::pin(archived(&s))),
@@ -124,6 +139,7 @@ async fn inventory() {
 
 /// A reconcile records every declared repository of both fleets exactly as the locks say.
 async fn baseline(s: &Suite) -> anyhow::Result<()> {
+    settled(s).await?;
     let r = s.stack.reconcile(&s.connection).await?;
     anyhow::ensure!(
         r.status.as_str() == "succeeded",
@@ -143,6 +159,7 @@ async fn baseline(s: &Suite) -> anyhow::Result<()> {
         h.observed,
         listed.len()
     );
+    record_histories(s, &r.id.to_string(), &h.id.to_string()).await?;
     let want = expected(&s.side)?;
     let repos = s.stack.repos(&s.connection, false).await?;
     let (diffs, extras) = compare(&want, &repos);
@@ -169,8 +186,34 @@ async fn baseline(s: &Suite) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// With REPOPLANE_RECORD_HISTORIES=1 on the local sandbox, saves the baseline's workflow
+/// histories for repoplane-flow's replay test, which fails when a workflow change would no
+/// longer replay the runs already in flight.
+async fn record_histories(s: &Suite, reconcile: &str, refresh: &str) -> anyhow::Result<()> {
+    if s.side.sandbox != "local"
+        || std::env::var("REPOPLANE_RECORD_HISTORIES").as_deref() != Ok("1")
+    {
+        return Ok(());
+    }
+    let dir = repoplane_e2e::workspace_root().join("crates/repoplane-flow/tests/histories");
+    std::fs::create_dir_all(&dir)?;
+    let rec = s
+        .stack
+        .history_json::<repoplane_flow::ReconcileWorkflow>(reconcile)
+        .await?;
+    std::fs::write(dir.join("reconcile.json"), rec)?;
+    let hrf = s
+        .stack
+        .history_json::<repoplane_flow::RefreshHeadsWorkflow>(refresh)
+        .await?;
+    std::fs::write(dir.join("refresh-heads.json"), hrf)?;
+    eprintln!("recorded workflow histories in {}", dir.display());
+    Ok(())
+}
+
 /// Reconciles and checks the inventory against the locks again.
 async fn resync(s: &Suite) -> anyhow::Result<()> {
+    settled(s).await?;
     let r = s.stack.reconcile(&s.connection).await?;
     anyhow::ensure!(
         r.status.as_str() == "succeeded",
@@ -369,7 +412,7 @@ async fn shifting_listing(s: &Suite) -> anyhow::Result<()> {
         eprintln!("skipped: only on the local sandbox");
         return Ok(());
     }
-    let proxy = ShiftingProxy::start(&s.side).await?;
+    let proxy = ForgeProxy::start(&s.side).await?;
     let conn = "e2e-local-shifting";
     s.stack
         .cli(&[
@@ -445,6 +488,143 @@ async fn shifting_listing(s: &Suite) -> anyhow::Result<()> {
     outcome
 }
 
+/// Temporal holds the run while no worker serves the connection's queue: the worker dies, a
+/// reconcile is requested and cannot finish, a worker comes back, and that same run completes
+/// with the inventory intact. Local only: what is tested is the orchestration, not the forge.
+async fn worker_killed(s: &Suite) -> anyhow::Result<()> {
+    if s.side.sandbox != "local" {
+        eprintln!("skipped: only on the local sandbox");
+        return Ok(());
+    }
+    s.stack.kill_worker().await?;
+    let started: repoplane_proto::api::Reconcile = s
+        .stack
+        .cli_json(&["connection", "reconcile", &s.connection])
+        .await?;
+    let id = started.id.to_string();
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let waiting: repoplane_proto::api::Reconcile =
+        s.stack.cli_json(&["reconcile", "show", &id]).await?;
+    anyhow::ensure!(
+        !waiting.status.is_terminal(),
+        "with no worker the run ended anyway: {:?}",
+        waiting.status
+    );
+    s.stack.start_worker().await?;
+    let done: repoplane_proto::api::Reconcile = s
+        .stack
+        .cli_json(&["reconcile", "show", &id, "--wait", "--timeout", "5m"])
+        .await?;
+    anyhow::ensure!(
+        done.status.as_str() == "succeeded" && done.recorded == 0 && done.inaccessible == 0,
+        "after the worker came back: {:?}, recorded {}, inaccessible {}, error {:?}",
+        done.status,
+        done.recorded,
+        done.inaccessible,
+        done.error
+    );
+    let (diffs, _) = compare(
+        &expected(&s.side)?,
+        &s.stack.repos(&s.connection, false).await?,
+    );
+    anyhow::ensure!(diffs.is_empty(), "{}", diffs.join("\n"));
+    Ok(())
+}
+
+/// A forge that asks for an hour's pause: longer than one call may wait, so the activity fails,
+/// retryably, and Temporal runs it again a moment later. Local only: the 429 comes from a proxy.
+async fn rate_limited(s: &Suite) -> anyhow::Result<()> {
+    if s.side.sandbox != "local" {
+        eprintln!("skipped: only on the local sandbox");
+        return Ok(());
+    }
+    let proxy = ForgeProxy::start(&s.side).await?;
+    let conn = "e2e-local-ratelimited";
+    s.stack
+        .cli(&[
+            "connection",
+            "add",
+            "forgejo",
+            "--name",
+            conn,
+            "--org",
+            &s.side.org,
+            "--auth",
+            "token",
+            "--token-env",
+            &s.side.token_env,
+            "--base-url",
+            &proxy.base_url,
+        ])
+        .await?;
+    proxy.rate_limit_next(2);
+    let r = s.stack.reconcile(conn).await?;
+    anyhow::ensure!(
+        r.status.as_str() == "succeeded" && r.discovered == 123,
+        "reconcile {:?}, discovered {}, error {:?}",
+        r.status,
+        r.discovered,
+        r.error
+    );
+    anyhow::ensure!(
+        proxy.rate_limited() == 2,
+        "the proxy rate-limited {} call(s), want 2",
+        proxy.rate_limited()
+    );
+    Ok(())
+}
+
+/// A token the forge refuses will not get better with retries: the run fails at once, saying
+/// why, and marks nothing.
+async fn refused(s: &Suite) -> anyhow::Result<()> {
+    if s.side.sandbox != "local" {
+        eprintln!("skipped: only on the local sandbox");
+        return Ok(());
+    }
+    let proxy = ForgeProxy::start(&s.side).await?;
+    let conn = "e2e-local-refused";
+    s.stack
+        .cli(&[
+            "connection",
+            "add",
+            "forgejo",
+            "--name",
+            conn,
+            "--org",
+            &s.side.org,
+            "--auth",
+            "token",
+            "--token-env",
+            &s.side.token_env,
+            "--base-url",
+            &proxy.base_url,
+        ])
+        .await?;
+    proxy.refuse_token(true);
+    let begun = std::time::Instant::now();
+    let out = s
+        .stack
+        .cli(&[
+            "connection",
+            "reconcile",
+            conn,
+            "--wait",
+            "--output",
+            "json",
+        ])
+        .await;
+    let err = out
+        .expect_err("a refused token must fail the reconcile")
+        .to_string();
+    anyhow::ensure!(err.contains("\"failed\"") && err.contains("401"), "{err}");
+    anyhow::ensure!(
+        begun.elapsed() < std::time::Duration::from_secs(30),
+        "failing took {:?}: a 401 must not be retried",
+        begun.elapsed()
+    );
+    Ok(())
+}
+
 /// A topic added on the forge shows up after the next reconcile, and nothing else moves.
 async fn topic_changed(s: &Suite) -> anyhow::Result<()> {
     if !s.side.forge.caps().topics {
@@ -499,6 +679,100 @@ async fn commit_pushed(s: &Suite) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Waits until the forge's own listing matches the locks — default branch, archived, topics —
+/// before a reconcile is asked to: forges take a moment to show a reset in their listings
+/// (Azure DevOps about two seconds for a default branch), and what is tested is repoplane
+/// recording what the listing says, not how fast a forge propagates.
+async fn settled(s: &Suite) -> anyhow::Result<()> {
+    let want = expected(&s.side)?;
+    let lister = s.side.lister()?;
+    let begun = std::time::Instant::now();
+    let mut polls = 0;
+    loop {
+        polls += 1;
+        let mut listed = std::collections::BTreeMap::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = lister.page(cursor.as_deref()).await?;
+            for r in page.repos {
+                listed.insert(r.snapshot.full_name.clone(), r.snapshot);
+            }
+            match page.next {
+                Some(n) => cursor = Some(n),
+                None => break,
+            }
+        }
+        let differing: Vec<&String> = want
+            .iter()
+            .filter(|(name, e)| {
+                listed.get(*name).is_none_or(|r| {
+                    let topics = r.topics.clone().map(|mut t| {
+                        t.sort();
+                        t
+                    });
+                    (e.default_branch.is_some() && r.default_branch != e.default_branch)
+                        || r.archived != e.archived
+                        || topics != e.topics
+                })
+            })
+            .map(|(name, _)| name)
+            .collect();
+        if differing.is_empty() {
+            if polls > 1 {
+                eprintln!(
+                    "{} listing settled after {:?} ({polls} reads)",
+                    s.side.forge,
+                    begun.elapsed()
+                );
+            }
+            return Ok(());
+        }
+        if begun.elapsed() > std::time::Duration::from_secs(120) {
+            anyhow::bail!(
+                "after {:?} the forge still lists differently: {differing:?}",
+                begun.elapsed()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// Pages through the forge's listing, through repoplane's own adapter, until `name` appears
+/// matching `want`; returns how long that took. Fails after two minutes, naming what it saw.
+async fn until_listed(
+    s: &Suite,
+    name: &str,
+    want: impl Fn(&repoplane_proto::inventory::RepoSnapshot) -> bool,
+) -> anyhow::Result<std::time::Duration> {
+    let lister = s.side.lister()?;
+    let begun = std::time::Instant::now();
+    loop {
+        let mut cursor: Option<String> = None;
+        let mut seen = None;
+        loop {
+            let page = lister.page(cursor.as_deref()).await?;
+            if let Some(r) = page.repos.iter().find(|r| r.snapshot.full_name == name) {
+                seen = Some(r.snapshot.clone());
+                break;
+            }
+            match page.next {
+                Some(n) => cursor = Some(n),
+                None => break,
+            }
+        }
+        if seen.as_ref().is_some_and(&want) {
+            return Ok(begun.elapsed());
+        }
+        if begun.elapsed() > std::time::Duration::from_secs(120) {
+            anyhow::bail!(
+                "after {:?} the forge still lists {name} as {seen:?}",
+                begun.elapsed()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// A HEAD describes a branch. When the default branch changes, the recorded HEAD described the
 /// old one: the next reconcile clears it, and the next head refresh reads the new branch's.
 async fn default_branch_changed(s: &Suite) -> anyhow::Result<()> {
@@ -517,6 +791,17 @@ async fn default_branch_changed(s: &Suite) -> anyhow::Result<()> {
         )
         .await?;
     let name = s.side.full_name("compliant");
+    // Wait for the forge's own listing to show the change before asking repoplane to see it:
+    // what is tested is that a reconcile records what the listing says, not how quickly a forge
+    // propagates a settings change to its listing.
+    let lag = until_listed(s, &name, |r| {
+        r.default_branch.as_deref() == Some("e2e-default")
+    })
+    .await?;
+    eprintln!(
+        "{} listed the new default branch after {lag:?}",
+        s.side.forge
+    );
     let find = |repos: Vec<repoplane_proto::api::Repository>| {
         repos
             .into_iter()

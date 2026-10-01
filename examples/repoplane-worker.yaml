@@ -1,7 +1,9 @@
-# repoplane-worker configuration. The worker only makes outbound HTTPS calls: to the API, and to
-# the forges of the connections on its queue. Forge tokens are read from the variables each
-# connection names (`--token-env`), in this worker's environment.
-api_url: http://127.0.0.1:8080
+# repoplane-worker configuration. The worker runs the forge activities of the connections on its
+# queue. It makes outbound calls only — to Temporal, and to those connections' forges — and reads
+# each connection's forge token from the variable the connection names, in its own environment.
 queue: default
-token_env: REPOPLANE_WORKER_TOKEN
-concurrency: 4
+concurrency: 8                             # forge activities at once
+temporal:
+  address: http://localhost:7233
+  namespace: default
+  # api_key_env: TEMPORAL_API_KEY

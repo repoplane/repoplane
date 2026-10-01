@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use repoplane_forge::{ForgeError, Listed, Lister, Page};
 use repoplane_proto::ForgeKind;
-use repoplane_proto::worker::RepoSnapshot;
+use repoplane_proto::inventory::RepoSnapshot;
 
 pub struct Fake {
     repos: HashMap<String, Listed>,

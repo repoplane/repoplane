@@ -1,6 +1,6 @@
 # 5. Inventory reconciliation is conservative
 
-**Status:** Kept; the offset-pagination gap closed · 2026-09-30
+**Status:** Kept; the offset-pagination gap closed; steps are workflow activities · 2026-10-01
 
 ## Context
 
@@ -9,8 +9,8 @@ repositories from every later count.
 
 ## Decision
 
-Each run takes a watermark when a worker starts listing, and every repository it sees is
-stamped with it. Only a run the worker completes, with every page read and uploaded, may mark
+Each run takes a watermark when its workflow starts (`start_reconcile`), and every repository it sees is
+stamped with it. Only a workflow that read every page, and looked up every repository it did not see, may mark
 older rows inaccessible. A failed or interrupted run marks nothing. Rows are never deleted. An
 older run can never overwrite a row a newer one wrote.
 
@@ -20,10 +20,10 @@ A complete listing is still not proof of absence. On forges paged by offset (For
 GitLab), deleting a repository mid-listing shifts every later page back by one, so a complete
 listing can skip a repository that still exists.
 
-So before completing, the worker asks the API which active repositories this run has not seen
-(`POST /v1/worker/tasks/{id}/unseen`), and looks each up directly by the forge's id
-(`Lister::get`). Found ones are uploaded like any listed repository, under their current name
-if they were renamed. Only the rest are left for `complete` to mark. A repository transferred
+So before finishing, the workflow asks which active repositories the run has not seen (the
+`unseen` activity), and looks each up directly by the forge's id (the `lookup` activity, over
+`Lister::get`). Found ones are uploaded like any listed repository, under their current name
+if they were renamed. Only the rest are left for `finish_reconcile` to mark. A repository transferred
 out of the organisation, or scheduled for deletion on GitLab, counts as gone. Azure DevOps answers
 a disabled repository's lookup with a 404, so its `get` checks the listing before it believes
 one.

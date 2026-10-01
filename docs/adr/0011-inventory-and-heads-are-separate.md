@@ -1,6 +1,6 @@
 # 11. Inventory and HEADs are separate operations
 
-**Status:** New · 2026-10-01
+**Status:** New · 2026-10-01; runs are workflows (ADR 0012)
 
 ## Context
 
@@ -21,7 +21,7 @@ should not pay for the other hundred.
   targets, which are fixed when it is requested. It records each HEAD with `head_observed_at`
   and reports *targeted / observed / changed*. A scan will run one on its own targets before
   deciding which repositories changed.
-- **Both are tasks on the same queues**, with the same lease, heartbeat and failure handling.
+- **Each is a Temporal workflow** (ADR 0012), with the same retry and failure handling.
 
 ## Consequences
 
