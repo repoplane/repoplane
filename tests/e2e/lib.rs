@@ -29,8 +29,6 @@ use tokio::process::{Child, Command};
 /// The two fleets every sandbox holds. Their names never collide: `shapes` keeps the root and
 /// `platform`/`services`, `scale` everything under `acme/`.
 pub const FLEETS: [&str; 2] = ["shapes", "scale"];
-/// forgelab's marker: on every repository it made, and absent from the locks.
-pub const MARKER_TOPIC: &str = "forgelab-managed";
 
 pub fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -759,12 +757,8 @@ pub fn expected(side: &ForgeSide) -> anyhow::Result<BTreeMap<String, Expected>> 
             // A disabled Azure DevOps repository refuses reads: its HEAD is unknown.
             let unreadable =
                 r.archived && caps.archived == repoplane_proto::forge::Archived::Disabled;
-            let topics = caps.topics.then(|| {
-                let mut t = r.topics.clone();
-                t.push(MARKER_TOPIC.to_string());
-                t.sort();
-                t
-            });
+            // Exactly the fleet's: forgelab's marker is in the description, not the topics.
+            let topics = caps.topics.then(|| r.topics.clone());
             out.insert(
                 side.full_name(&r.name),
                 Expected {

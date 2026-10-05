@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use forgelab::forge::Settings;
-use repoplane_e2e::{ForgeProxy, ForgeSide, MARKER_TOPIC, Stack, compare, expected, sandbox};
+use repoplane_e2e::{ForgeProxy, ForgeSide, Stack, compare, expected, sandbox};
 use repoplane_proto::ForgeKind;
 use repoplane_proto::api::RepositoryStatus;
 
@@ -331,7 +331,7 @@ async fn table_output(s: &Suite) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("{billing} missing from:\n{out}"))?;
     let cols: Vec<&str> = line.split_whitespace().collect();
     anyhow::ensure!(cols[1..4] == ["main", "false", "b8a1a303"], "{line}");
-    anyhow::ensure!(cols[4..] == [MARKER_TOPIC, "node", "service"], "{line}");
+    anyhow::ensure!(cols[4..] == ["node", "service"], "{line}");
     Ok(())
 }
 
@@ -634,7 +634,7 @@ async fn topic_changed(s: &Suite) -> anyhow::Result<()> {
     env.forge
         .set_topics(
             "parser-svc",
-            &[MARKER_TOPIC.into(), "service".into(), "e2e-topic".into()],
+            &["service".into(), "e2e-topic".into()],
         )
         .await?;
     let r = s.stack.reconcile(&s.connection).await?;
