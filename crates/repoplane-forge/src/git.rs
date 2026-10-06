@@ -113,36 +113,48 @@ pub async fn ls_remote(
 /// A failed `ls-remote`, read from what git said: a repository gone since the listing has no
 /// HEAD; a refused credential will not get better; anything else may.
 fn classify(forge: &'static str, path: String, stderr: &str) -> Result<Option<String>, ForgeError> {
-    let lower = stderr.to_ascii_lowercase();
+    let refused = |status: u16| ForgeError::Status {
+        forge,
+        class: Class::Auth,
+        status,
+        method: "git ls-remote".into(),
+        path: path.clone(),
+        body: stderr.to_string(),
+    };
+    // The HTTP status, when git says it, decides: "The requested URL returned error: 503".
+    match http_status(stderr) {
+        Some(404) => return Ok(None),
+        Some(s @ (401 | 403)) => return Err(refused(s)),
+        Some(_) => return Err(transient(forge, path, stderr)),
+        None => {}
+    }
+    // Otherwise the words, read without the URLs in them: a repository named
+    // `identity-permissions-api` answered 503, and "permission" in its URL read as a refusal.
+    let words = without_urls(&stderr.to_ascii_lowercase());
+    let refusal = [
+        "authentication failed",
+        "access denied",
+        "permission denied",
+        "not authorized",
+    ];
+    if refusal.iter().any(|p| words.contains(p)) {
+        return Err(refused(401));
+    }
     let gone = [
         "not found",
         "does not exist",
         "could not be found",
         "does not appear to be a git repository",
-        "404",
     ];
-    if gone.iter().any(|p| lower.contains(p)) && !lower.contains("authentication") {
+    if gone.iter().any(|p| words.contains(p)) {
         return Ok(None);
     }
-    let refused = [
-        "authentication failed",
-        "401",
-        "403",
-        "access denied",
-        "permission",
-        "not authorized",
-    ];
-    if refused.iter().any(|p| lower.contains(p)) {
-        return Err(ForgeError::Status {
-            forge,
-            class: Class::Auth,
-            status: if lower.contains("403") { 403 } else { 401 },
-            method: "git ls-remote".into(),
-            path,
-            body: stderr.to_string(),
-        });
-    }
-    Err(ForgeError::Transport {
+    Err(transient(forge, path, stderr))
+}
+
+/// A failure that may pass: the forge was busy or unreachable. Temporal retries it.
+fn transient(forge: &'static str, path: String, stderr: &str) -> ForgeError {
+    ForgeError::Transport {
         forge,
         method: "git ls-remote".into(),
         path,
@@ -151,7 +163,37 @@ fn classify(forge: &'static str, path: String, stderr: &str) -> Result<Option<St
         } else {
             stderr.to_string()
         },
-    })
+    }
+}
+
+/// The status in git's "The requested URL returned error: 503".
+fn http_status(stderr: &str) -> Option<u16> {
+    let rest = &stderr[stderr.find("returned error: ")? + "returned error: ".len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// `s` with every URL and every quoted part (git quotes the URL it failed on) blanked, so that
+/// a repository's name is never read as what happened to it.
+fn without_urls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut quoted = false;
+    for word in s.split_inclusive(char::is_whitespace) {
+        let bare = word.trim_end();
+        if bare.contains("://") {
+            out.push(' ');
+            continue;
+        }
+        for c in word.chars() {
+            if c == '\'' {
+                quoted = !quoted;
+                out.push(' ');
+            } else if !quoted {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// The environment git runs in: nothing from the caller but the passthrough variables, no
@@ -317,6 +359,52 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(head, None);
+    }
+
+    /// What happened is read from the status git reports, or from its words, never from the
+    /// repository's name or URL.
+    #[test]
+    fn a_failure_is_read_from_what_git_says_not_the_url() {
+        let read = |stderr: &str| classify("t", "/o/r".into(), stderr);
+        // Azure DevOps, 2026-10-06: a 503 on a repository named for permissions.
+        let busy = read(
+            "fatal: unable to access 'https://dev.azure.com/o/p/_git/identity-permissions-api/': The requested URL returned error: 503",
+        )
+        .unwrap_err();
+        assert!(busy.retryable(), "{busy}");
+        let busy = read(
+            "fatal: unable to access 'https://x/o/not-found-handler-404/': The requested URL returned error: 502",
+        )
+        .unwrap_err();
+        assert!(busy.retryable());
+        assert!(
+            read("fatal: unable to access 'https://x/o/r/': The requested URL returned error: 429")
+                .unwrap_err()
+                .retryable()
+        );
+        assert_eq!(
+            read("fatal: unable to access 'https://x/o/r/': The requested URL returned error: 403")
+                .unwrap_err()
+                .class(),
+            Some(Class::Auth)
+        );
+        assert_eq!(
+            read("fatal: unable to access 'https://x/o/r/': The requested URL returned error: 404")
+                .unwrap(),
+            None
+        );
+        // GitHub says a missing repository in words, quoting the URL.
+        assert_eq!(
+            read("remote: Repository not found.\nfatal: repository 'https://github.com/o/r.git/' not found")
+                .unwrap(),
+            None
+        );
+        // A repository named like a refusal, failing to resolve: transient.
+        assert!(
+            read("fatal: unable to access 'https://x/o/access-denied-page/': Could not resolve host: x")
+                .unwrap_err()
+                .retryable()
+        );
     }
 
     #[test]
