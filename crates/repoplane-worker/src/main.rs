@@ -40,18 +40,19 @@ struct Config {
     queue: String,
     /// Forge activities run at once: the only bound on fan-out. Workflows schedule every page,
     /// lookup and HEAD read at once, and Temporal hands this worker as many as it has slots.
-    /// A HEAD read is one `git ls-remote`, a process and a TLS handshake, so it takes more in
-    /// flight than API calls to go as fast. Measured on ~125-repository sandboxes, a full head
-    /// refresh (one each, 2026-10-01):
+    /// A HEAD read is one `git ls-remote`, a process and a TLS handshake that mostly waits on
+    /// the network, so it takes many in flight to go fast. Median of three syncs, HEADs only
+    /// (2026-10-06, debug build):
     ///
-    /// | in flight | GitHub | GitLab | Azure DevOps |
+    /// | slots | GitHub, 2,139 | GitLab, 599 | Azure DevOps, 2,144 |
     /// |---|---|---|---|
-    /// | API (REST/GraphQL), 8 | 7.2 s | 11.0 s | 1.6 s |
-    /// | git, 8 | 10.1 s | 16.5 s | 3.7 s |
-    /// | git, 32 | 3.4 s | 7.7 s | 1.2 s |
-    /// | git, 64 | 4.4 s | 4.9 s | 0.9 s |
+    /// | 32 | 39.1 s | 16.0 s | 18.7 s |
+    /// | 64 | 20.9 s | 8.7 s | 18.6 s |
+    /// | 128 | 17.2 s | | |
     ///
-    /// 32 also stays well under GitHub's 100 concurrent requests per token, for the listing.
+    /// 64 takes most of the gain and stays under GitHub's 100 concurrent requests per token,
+    /// which the API calls here (listing pages, lookups by id) count against; 128 could pass it
+    /// when many lookups run at once. Azure DevOps answers no faster above 32.
     #[serde(default = "default_concurrency")]
     concurrency: usize,
     #[serde(default)]
@@ -62,7 +63,7 @@ fn default_queue() -> String {
     "default".into()
 }
 fn default_concurrency() -> usize {
-    32
+    64
 }
 
 fn load(cli: &Cli) -> anyhow::Result<Config> {

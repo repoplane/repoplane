@@ -2,7 +2,7 @@
 # queue. It makes outbound calls only — to Temporal, and to those connections' forges — and reads
 # each connection's forge token from the variable the connection names, in its own environment.
 queue: default
-concurrency: 32                            # forge activities at once: the bound on fan-out
+concurrency: 64                            # forge activities at once: the bound on fan-out
 temporal:
   address: http://localhost:7233
   namespace: default

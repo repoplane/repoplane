@@ -99,7 +99,7 @@ Campaigns will need all of this: waiting for merges, waves, pausing.
 | `SyncWorkflow` (`connection sync`) | `start_sync` → `ReconcileWorkflow` as a child, under the reconcile's run id → `sync_heads` (requests a refresh of every active repository, once) → `RefreshHeadsWorkflow` as a child, under the refresh's run id → `finish_sync`. A failing step fails the sync with the step's reason (ADR 0013). |
 
 Workflows size no batches for speed. They schedule every page, lookup and HEAD read at once,
-and the worker's activity slots (`concurrency`, 32 by default) are the only bound on how many
+and the worker's activity slots (`concurrency`, 64 by default) are the only bound on how many
 run at a time: Temporal hands a worker as many tasks as it has free slots. Each forge step is
 retried on its own, so one repository the forge could not answer for is retried alone.
 
@@ -177,9 +177,10 @@ How the remote is built:
   variables pass through.
 - Empty and disabled repositories cost no call.
 
-Measured on the sandboxes (about 125 repos each), a full refresh with 32 slots takes 3.3 s on
-GitHub, 4.4 s on GitLab and 1.6 s on Azure DevOps (median of three runs, 2026-10-01), against
-7.2 s, 11.0 s and 1.6 s through the APIs before. The worker needs `git` on its `PATH`.
+Measured on the reseeded sandboxes (median of three syncs, 2026-10-06), reading the HEADs takes
+20.9 s for 2,139 repositories on GitHub, 8.7 s for 599 on GitLab and 18.6 s for 2,144 on Azure
+DevOps, with the default 64 slots. At 32 slots GitHub and GitLab take twice as long; Azure DevOps
+answers no faster above 32. The worker needs `git` on its `PATH`.
 
 **Listing pages are all scheduled at once when the forge says how many there are.** The first page's
 `Link rel="last"` names the last page: GitHub, Forgejo and GitLab send it (gitlab.com stops
@@ -254,6 +255,11 @@ expected.
     completes when a worker returns.
 
 ## Known gaps
+
+- Azure DevOps answers the whole organisation in one listing call, so its single `list_page`
+  result carries every repository: 888 KB for 2,144 of them. Temporal warns above 512 KB
+  (TMPRL1103) and refuses a payload above 2 MB, so from about 4,800 repositories a reconcile
+  would fail. The adapter needs to hand the listing back in pieces.
 
 - A reconcile's history carries every page it recorded: about 1.8 MB for 2,139 repositories,
   against Temporal's 50 MB per workflow. Organisations past a few tens of thousands of
