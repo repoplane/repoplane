@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use repoplane_proto::api::{
     Connection, ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
-    RepositoryList,
+    RepositoryList, Sync,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -75,6 +75,25 @@ impl Client {
         wait: Option<Duration>,
     ) -> anyhow::Result<Reconcile> {
         let mut req = self.http.get(self.url(&format!("/reconciles/{}", seg(id))));
+        if let Some(w) = wait {
+            req = req
+                .query(&[("wait", format!("{}s", w.as_secs()))])
+                .timeout(w + Duration::from_secs(15));
+        }
+        self.send(req).await
+    }
+
+    pub async fn sync(&self, key: &str) -> anyhow::Result<Sync> {
+        self.send(
+            self.http
+                .post(self.url(&format!("/connections/{}/syncs", seg(key)))),
+        )
+        .await
+    }
+
+    /// The sync's state; with `wait`, held by the API until it ends or the wait is up.
+    pub async fn sync_status(&self, id: &str, wait: Option<Duration>) -> anyhow::Result<Sync> {
+        let mut req = self.http.get(self.url(&format!("/syncs/{}", seg(id))));
         if let Some(w) = wait {
             req = req
                 .query(&[("wait", format!("{}s", w.as_secs()))])

@@ -1,6 +1,7 @@
 //! The HTTP surface: `/v1` for clients, behind the admin token. Asking for a reconcile or a head
-//! refresh records the run, then starts its Temporal workflow; reading a run reads Postgres. The
-//! API never calls a forge (ADR 0002).
+//! refresh records the run, then starts its Temporal workflow; reading a run reads Postgres, and
+//! asks Temporal about a run still in flight, so one whose workflow ended or stalled without
+//! recording it is recorded as failed. The API never calls a forge (ADR 0002).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,21 +13,34 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use repoplane_flow::{
     CONTROL_QUEUE, ReconcileInput, ReconcileWorkflow, RefreshHeadsInput, RefreshHeadsWorkflow,
-    workflow_id,
+    SyncInput, SyncWorkflow, workflow_id,
 };
 use repoplane_proto::api::{Connection, RunStatus};
 use repoplane_proto::api::{
     ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
-    RepositoryList,
+    RepositoryList, Sync,
 };
-use repoplane_proto::id::{HeadRefreshId, ReconcileId};
+use repoplane_proto::id::{HeadRefreshId, ReconcileId, SyncId};
 use repoplane_proto::inventory::ConnectionSpec;
 use repoplane_store::{RepoFilter, Store, StoreError};
 use serde::Deserialize;
-use temporalio_client::{Client, WorkflowIdConflictPolicy, WorkflowStartOptions};
+use temporalio_client::errors::WorkflowInteractionError;
+use temporalio_client::{
+    Client, UntypedWorkflow, WorkflowDescribeOptions, WorkflowExecutionStatus,
+    WorkflowIdConflictPolicy, WorkflowStartOptions, WorkflowTerminateOptions,
+};
 
 const MAX_RECONCILE_WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(250);
+/// How often a run in flight is checked against its workflow while a request waits on it.
+const CHECK: Duration = Duration::from_secs(5);
+/// A workflow task that failed this many times in a row will not pass by itself: it is a limit
+/// or a bug (Temporal retries it forever, with backoff), so the run is ended rather than left
+/// `running`. Measured: 2,139 HEAD reads scheduled at once hit Temporal's 2,000 pending
+/// activities per workflow, and the task failed on every attempt.
+const STALLED_ATTEMPTS: i32 = 5;
+/// A run younger than this may not have its workflow yet: the row is written before it starts.
+const START_GRACE: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,6 +63,8 @@ pub fn router(state: AppState) -> Router {
             post(request_head_refresh),
         )
         .route("/head-refreshes/{id}", get(get_head_refresh))
+        .route("/connections/{key}/syncs", post(request_sync))
+        .route("/syncs/{id}", get(get_sync))
         .route("/repositories", get(list_repositories));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -196,6 +212,13 @@ async fn request_reconcile(
     admin(&s, &h)?;
     let c = s.store.connection(&key).await?;
     let (r, created) = s.store.request_reconcile(&c).await?;
+    // The run in flight may be one whose workflow ended or stalled without saying so: settle it
+    // first, so a dead run is not joined for ever.
+    let (r, created) = if !created && settle(&s, Run::Reconcile(r.id), r.requested_at).await {
+        s.store.request_reconcile(&c).await?
+    } else {
+        (r, created)
+    };
     if !created {
         // One reconcile per connection at a time: this request joins the one in flight.
         return Ok((StatusCode::OK, Json(r)));
@@ -236,20 +259,109 @@ fn start_options(run: &impl std::fmt::Display) -> WorkflowStartOptions {
         .build()
 }
 
+#[derive(Clone, Copy)]
 enum Run {
     Reconcile(ReconcileId),
     Refresh(HeadRefreshId),
+    Sync(SyncId),
+}
+
+impl Run {
+    fn workflow_id(&self) -> String {
+        match self {
+            Run::Reconcile(id) => workflow_id(id),
+            Run::Refresh(id) => workflow_id(id),
+            Run::Sync(id) => workflow_id(id),
+        }
+    }
+
+    async fn fail(&self, s: &AppState, message: &str) -> Result<(), StoreError> {
+        match *self {
+            Run::Reconcile(id) => s.store.fail_reconcile(id, message).await,
+            Run::Refresh(id) => s.store.fail_refresh(id, message).await,
+            Run::Sync(id) => s.store.fail_sync(id, message).await,
+        }
+    }
+}
+
+/// Checks a run still in flight against its workflow, and records it as failed when the
+/// workflow will never record it: it was closed without completing (terminated, timed out,
+/// failed, canceled), it no longer exists, or its workflow task keeps failing. Returns whether
+/// the run was recorded as failed. A Temporal that cannot be reached changes nothing.
+async fn settle(s: &AppState, run: Run, requested_at: chrono::DateTime<chrono::Utc>) -> bool {
+    let handle = s
+        .temporal
+        .get_workflow_handle::<UntypedWorkflow>(run.workflow_id());
+    let why = match handle.describe(WorkflowDescribeOptions::default()).await {
+        Ok(d) => match d.status() {
+            WorkflowExecutionStatus::Running => {
+                let attempt = d
+                    .raw_description
+                    .pending_workflow_task
+                    .as_ref()
+                    .map_or(0, |t| t.attempt);
+                if attempt < STALLED_ATTEMPTS {
+                    return false;
+                }
+                let problem = problems(&d).unwrap_or_else(|| "see the workflow in Temporal".into());
+                let why = format!(
+                    "the workflow stalled: its task failed {attempt} times in a row ({problem})"
+                );
+                let stop = WorkflowTerminateOptions::builder()
+                    .reason(why.clone())
+                    .build();
+                if let Err(e) = handle.terminate(stop).await {
+                    tracing::warn!(workflow = %run.workflow_id(), error = %e, "could not end a stalled workflow");
+                    return false;
+                }
+                why
+            }
+            WorkflowExecutionStatus::Completed => {
+                "the workflow completed without recording the run".into()
+            }
+            WorkflowExecutionStatus::Failed => "the workflow failed".into(),
+            WorkflowExecutionStatus::Terminated => "the workflow was terminated".into(),
+            WorkflowExecutionStatus::TimedOut => "the workflow timed out".into(),
+            WorkflowExecutionStatus::Canceled => "the workflow was canceled".into(),
+            _ => return false,
+        },
+        Err(WorkflowInteractionError::NotFound(_)) => {
+            let age = chrono::Utc::now() - requested_at;
+            if age.to_std().unwrap_or_default() < START_GRACE {
+                return false;
+            }
+            "the workflow does not exist in Temporal (never started, or past retention)".into()
+        }
+        Err(e) => {
+            tracing::warn!(workflow = %run.workflow_id(), error = %e, "could not check a run in flight");
+            return false;
+        }
+    };
+    tracing::warn!(workflow = %run.workflow_id(), reason = %why, "recording a run its workflow will not finish");
+    match run.fail(s, &why).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(error = %e, "could not record a run its workflow will not finish");
+            false
+        }
+    }
+}
+
+/// What Temporal reports wrong with a workflow, from its `TemporalReportedProblems` attribute:
+/// `category=WorkflowTaskFailed, cause=WorkflowTaskFailedCausePendingActivitiesLimitExceeded`.
+fn problems(d: &temporalio_client::WorkflowExecutionDescription) -> Option<String> {
+    let info = d.raw_description.workflow_execution_info.as_ref()?;
+    let attrs = info.search_attributes.as_ref()?;
+    let raw = attrs.indexed_fields.get("TemporalReportedProblems")?;
+    let list: Vec<String> = serde_json::from_slice(&raw.data).ok()?;
+    (!list.is_empty()).then(|| list.join(", "))
 }
 
 /// Temporal would not take the workflow: the run is recorded as failed, so nothing waits on a
 /// run that will never start, and the caller hears why.
 async fn not_started(s: &AppState, run: Run, message: String) -> ApiError {
     let message = format!("could not start the workflow: {message}");
-    let recorded = match run {
-        Run::Reconcile(id) => s.store.fail_reconcile(id, &message).await,
-        Run::Refresh(id) => s.store.fail_refresh(id, &message).await,
-    };
-    if let Err(e) = recorded {
+    if let Err(e) = run.fail(s, &message).await {
         tracing::error!(error = %e, "could not record a run that never started");
     }
     tracing::error!("{message}");
@@ -295,9 +407,19 @@ async fn get_reconcile(
         None => Duration::ZERO,
     };
     let deadline = tokio::time::Instant::now() + wait;
+    let mut checked: Option<tokio::time::Instant> = None;
     loop {
         let r = s.store.reconcile(id).await?;
-        if r.status.is_terminal() || tokio::time::Instant::now() + POLL > deadline {
+        if r.status.is_terminal() {
+            return Ok(Json(r));
+        }
+        if checked.is_none_or(|t| t.elapsed() >= CHECK) {
+            checked = Some(tokio::time::Instant::now());
+            if settle(&s, Run::Reconcile(id), r.requested_at).await {
+                continue;
+            }
+        }
+        if tokio::time::Instant::now() + POLL > deadline {
             return Ok(Json(r));
         }
         tokio::time::sleep(POLL).await;
@@ -351,9 +473,98 @@ async fn get_head_refresh(
         None => Duration::ZERO,
     };
     let deadline = tokio::time::Instant::now() + wait;
+    let mut checked: Option<tokio::time::Instant> = None;
     loop {
         let r = s.store.head_refresh(id).await?;
-        if r.status.is_terminal() || tokio::time::Instant::now() + POLL > deadline {
+        if r.status.is_terminal() {
+            return Ok(Json(r));
+        }
+        if checked.is_none_or(|t| t.elapsed() >= CHECK) {
+            checked = Some(tokio::time::Instant::now());
+            if settle(&s, Run::Refresh(id), r.requested_at).await {
+                continue;
+            }
+        }
+        if tokio::time::Instant::now() + POLL > deadline {
+            return Ok(Json(r));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// `connection sync`: a reconcile, then a head refresh of every active repository. Its
+/// reconcile is requested here, so a reconcile already in flight on the connection is refused
+/// rather than joined: the sync would not know when it started.
+async fn request_sync(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(key): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    admin(&s, &h)?;
+    let c = s.store.connection(&key).await?;
+    let (mut r, mut created) = s.store.request_reconcile(&c).await?;
+    if !created && settle(&s, Run::Reconcile(r.id), r.requested_at).await {
+        (r, created) = s.store.request_reconcile(&c).await?;
+    }
+    if !created {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            format!(
+                "a reconcile of {:?} is already running ({}); sync once it has finished",
+                c.name, r.id
+            ),
+        ));
+    }
+    let sync = s.store.create_sync(&c, r.id).await?;
+    let started = s
+        .temporal
+        .start_workflow(
+            SyncWorkflow::run,
+            SyncInput {
+                sync: sync.id,
+                reconcile: r.id,
+                connection: spec(&c),
+            },
+            start_options(&sync.id),
+        )
+        .await;
+    if let Err(e) = started {
+        let e = not_started(&s, Run::Sync(sync.id), e.to_string()).await;
+        let _ = Run::Reconcile(r.id).fail(&s, &e.message).await;
+        return Err(e);
+    }
+    Ok((StatusCode::CREATED, Json(sync)))
+}
+
+async fn get_sync(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<WaitQuery>,
+) -> ApiResult<Json<Sync>> {
+    admin(&s, &h)?;
+    let id: SyncId = id
+        .parse()
+        .map_err(|e: repoplane_proto::id::IdError| ApiError::bad(e.to_string()))?;
+    let wait = match q.wait.as_deref() {
+        Some(w) => parse_wait(w)?.min(MAX_RECONCILE_WAIT),
+        None => Duration::ZERO,
+    };
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut checked: Option<tokio::time::Instant> = None;
+    loop {
+        let r = s.store.sync(id).await?;
+        if r.status.is_terminal() {
+            return Ok(Json(r));
+        }
+        if checked.is_none_or(|t| t.elapsed() >= CHECK) {
+            checked = Some(tokio::time::Instant::now());
+            if settle(&s, Run::Sync(id), r.requested_at).await {
+                continue;
+            }
+        }
+        if tokio::time::Instant::now() + POLL > deadline {
             return Ok(Json(r));
         }
         tokio::time::sleep(POLL).await;

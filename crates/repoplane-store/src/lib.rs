@@ -4,6 +4,7 @@
 mod heads;
 mod repos;
 mod runs;
+mod syncs;
 
 use chrono::{DateTime, Utc};
 use repoplane_proto::api::{AuthMode, Connection, CreateConnection, Reconcile, RunStatus};

@@ -73,6 +73,16 @@ async fn inventory() {
             Box::pin(refresh_targets(&s)),
         ),
         (
+            "sync reconciles, then reads every HEAD",
+            false,
+            Box::pin(sync(&s)),
+        ),
+        (
+            "a run whose workflow is terminated is recorded as failed",
+            false,
+            Box::pin(terminated(&s)),
+        ),
+        (
             "a repository skipped by a shifting listing stays active",
             true,
             Box::pin(shifting_listing(&s)),
@@ -207,6 +217,11 @@ async fn record_histories(s: &Suite, reconcile: &str, refresh: &str) -> anyhow::
         .history_json::<repoplane_flow::RefreshHeadsWorkflow>(refresh)
         .await?;
     std::fs::write(dir.join("refresh-heads.json"), hrf)?;
+    let slice = s
+        .stack
+        .history_json::<repoplane_flow::ReadHeadsWorkflow>(&format!("{refresh}-heads-1"))
+        .await?;
+    std::fs::write(dir.join("refresh-heads-slice.json"), slice)?;
     eprintln!("recorded workflow histories in {}", dir.display());
     Ok(())
 }
@@ -490,6 +505,100 @@ async fn shifting_listing(s: &Suite) -> anyhow::Result<()> {
 /// Temporal holds the run while no worker serves the connection's queue: the worker dies, a
 /// reconcile is requested and cannot finish, a worker comes back, and that same run completes
 /// with the inventory intact. Local only: what is tested is the orchestration, not the forge.
+/// `connection sync`: a reconcile, then a head refresh of every active repository, each a run
+/// of its own under the sync.
+async fn sync(s: &Suite) -> anyhow::Result<()> {
+    let r: repoplane_proto::api::Sync = s
+        .stack
+        .cli_json(&[
+            "connection",
+            "sync",
+            &s.connection,
+            "--wait",
+            "--timeout",
+            "20m",
+        ])
+        .await?;
+    anyhow::ensure!(
+        r.status.as_str() == "succeeded",
+        "sync {}: {:?}",
+        r.status.as_str(),
+        r.error
+    );
+    let (diffs, _) = compare(
+        &expected(&s.side)?,
+        &s.stack.repos(&s.connection, false).await?,
+    );
+    anyhow::ensure!(diffs.is_empty(), "{}", diffs.join("\n"));
+    let active = s.stack.repos(&s.connection, false).await?.len() as i64;
+    let h = r
+        .head_refresh
+        .ok_or_else(|| anyhow::anyhow!("the sync has no head refresh"))?;
+    anyhow::ensure!(
+        r.reconcile.status.as_str() == "succeeded" && r.reconcile.discovered == active,
+        "reconcile {}: discovered {}, want {active}",
+        r.reconcile.status.as_str(),
+        r.reconcile.discovered
+    );
+    anyhow::ensure!(
+        h.status.as_str() == "succeeded" && h.targeted == active && h.observed == active,
+        "head refresh {}: targeted {}, observed {}, want {active}",
+        h.status.as_str(),
+        h.targeted,
+        h.observed
+    );
+    if s.side.sandbox == "local"
+        && std::env::var("REPOPLANE_RECORD_HISTORIES").as_deref() == Ok("1")
+    {
+        let dir = repoplane_e2e::workspace_root().join("crates/repoplane-flow/tests/histories");
+        let raw = s
+            .stack
+            .history_json::<repoplane_flow::SyncWorkflow>(&r.id.to_string())
+            .await?;
+        std::fs::write(dir.join("sync.json"), raw)?;
+    }
+    Ok(())
+}
+
+/// A run whose workflow is ended from outside (here, terminated in Temporal) never records
+/// itself; the API sees the workflow closed and records the run as failed, saying why. With no
+/// worker, the run cannot finish before it is terminated.
+async fn terminated(s: &Suite) -> anyhow::Result<()> {
+    if s.side.sandbox != "local" {
+        eprintln!("skipped: only on the local sandbox");
+        return Ok(());
+    }
+    s.stack.kill_worker().await?;
+    let outcome = async {
+        let started: repoplane_proto::api::Reconcile = s
+            .stack
+            .cli_json(&["connection", "reconcile", &s.connection])
+            .await?;
+        let id = started.id.to_string();
+        s.stack
+            .terminate(&id, "e2e: terminated from outside")
+            .await?;
+        let done: repoplane_proto::api::Reconcile = s
+            .stack
+            .cli_json_failing(&["reconcile", "show", &id, "--wait", "--timeout", "1m"])
+            .await?;
+        anyhow::ensure!(
+            done.status.as_str() == "failed"
+                && done
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("terminated")),
+            "want failed, saying it was terminated; got {} {:?}",
+            done.status.as_str(),
+            done.error
+        );
+        Ok(())
+    }
+    .await;
+    s.stack.start_worker().await?;
+    outcome
+}
+
 async fn worker_killed(s: &Suite) -> anyhow::Result<()> {
     if s.side.sandbox != "local" {
         eprintln!("skipped: only on the local sandbox");
@@ -632,10 +741,7 @@ async fn topic_changed(s: &Suite) -> anyhow::Result<()> {
     }
     let env = s.side.env("shapes")?;
     env.forge
-        .set_topics(
-            "parser-svc",
-            &["service".into(), "e2e-topic".into()],
-        )
+        .set_topics("parser-svc", &["service".into(), "e2e-topic".into()])
         .await?;
     let r = s.stack.reconcile(&s.connection).await?;
     anyhow::ensure!(r.recorded == 1, "recorded {}, want 1", r.recorded);

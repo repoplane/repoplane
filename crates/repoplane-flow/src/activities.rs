@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use temporalio_macros::activity_definitions;
 use temporalio_sdk::activities::ActivityError;
 
-use repoplane_proto::id::{HeadRefreshId, ReconcileId};
+use repoplane_proto::id::{HeadRefreshId, ReconcileId, SyncId};
 use repoplane_proto::inventory::{
-    ConnectionSpec, HeadTarget, ObservedHead, RepoSnapshot, UnseenRepo,
+    ConnectionSpec, HeadTarget, ObservedHead, RepoSnapshot, SyncHeads, UnseenRepo,
 };
 
 // --- forge activities: on the connection's queue, in repoplane-worker --------------------------
@@ -96,6 +96,12 @@ pub struct RefreshFailed {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncFailed {
+    pub sync: SyncId,
+    pub message: String,
+}
+
 pub struct Control;
 
 #[activity_definitions]
@@ -150,6 +156,27 @@ impl Control {
 
     #[activity]
     pub fn fail_refresh(input: RefreshFailed) -> Result<(), ActivityError> {
+        unimplemented!()
+    }
+
+    #[activity]
+    pub fn start_sync(input: SyncId) -> Result<(), ActivityError> {
+        unimplemented!()
+    }
+
+    /// Requests the sync's head refresh of every active repository, once.
+    #[activity]
+    pub fn sync_heads(input: SyncId) -> Result<SyncHeads, ActivityError> {
+        unimplemented!()
+    }
+
+    #[activity]
+    pub fn finish_sync(input: SyncId) -> Result<(), ActivityError> {
+        unimplemented!()
+    }
+
+    #[activity]
+    pub fn fail_sync(input: SyncFailed) -> Result<(), ActivityError> {
         unimplemented!()
     }
 }

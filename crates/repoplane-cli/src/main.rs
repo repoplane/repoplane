@@ -62,6 +62,17 @@ enum ConnectionCmd {
     List,
     /// Show one connection, by name or id.
     Show { connection: String },
+    /// Reconcile, then read the HEAD of every repository it left active: an up-to-date
+    /// inventory, HEADs included, in one run.
+    Sync {
+        connection: String,
+        /// Wait for the sync to finish, and exit non-zero if it fails.
+        #[arg(long)]
+        wait: bool,
+        /// How long --wait waits.
+        #[arg(long, default_value = "60m", value_parser = parse_duration)]
+        timeout: Duration,
+    },
     /// List the organisation's repositories now and record them.
     Reconcile {
         connection: String,
@@ -229,6 +240,21 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 r
             };
             print(out, render::reconcile(&r), &r)?;
+            return Ok(exit_for(r.status, wait));
+        }
+        Command::Connection(ConnectionCmd::Sync {
+            connection,
+            wait,
+            timeout,
+        }) => {
+            let r = api.sync(&connection).await?;
+            let r = if wait {
+                let id = r.id.to_string();
+                wait_until(timeout, |w| api.sync_status(&id, w), |r| r.status).await?
+            } else {
+                r
+            };
+            print(out, render::sync(&r), &r)?;
             return Ok(exit_for(r.status, wait));
         }
         Command::Reconcile(ReconcileCmd::Show { id, wait, timeout }) => {

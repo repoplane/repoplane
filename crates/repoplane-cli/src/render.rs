@@ -1,7 +1,7 @@
 //! What the CLI prints. Tables are padded to their widest cell plus three spaces; absent values
 //! print as `—`, which is never confused with an empty string or a zero.
 
-use repoplane_proto::api::{Connection, HeadRefresh, Reconcile, Repository};
+use repoplane_proto::api::{Connection, HeadRefresh, Reconcile, Repository, Sync};
 
 const ABSENT: &str = "—";
 
@@ -194,6 +194,68 @@ pub fn head_refresh(connection: &str, r: &HeadRefresh) -> String {
     out
 }
 
+/// ```text
+/// Sync        syn_06G9N0B1C2D3E4F5G6H7J8K9MN
+/// Status      succeeded
+/// Reconcile   rec_06G9N084KXVH9BQD3DW01R4TA4 succeeded
+/// Refresh     hrf_06G9N0A2QPZ3M4X5Y6T7V8W9RS succeeded
+///
+/// Discovered     6
+/// Recorded       6
+/// Inaccessible   0
+/// Targeted       6
+/// Observed       6
+/// Changed        6
+/// ```
+pub fn sync(r: &Sync) -> String {
+    let mut out = format!(
+        "{:<12}{}\n{:<12}{}\n",
+        "Sync",
+        r.id,
+        "Status",
+        r.status.as_str()
+    );
+    if let Some(e) = &r.error {
+        out.push_str(&format!("{:<12}{e}\n", "Error"));
+    }
+    out.push_str(&format!(
+        "{:<12}{} {}\n",
+        "Reconcile",
+        r.reconcile.id,
+        r.reconcile.status.as_str()
+    ));
+    match &r.head_refresh {
+        Some(h) => out.push_str(&format!(
+            "{:<12}{} {}\n",
+            "Refresh",
+            h.id,
+            h.status.as_str()
+        )),
+        None => out.push_str(&format!("{:<12}{ABSENT}\n", "Refresh")),
+    }
+    let h = r.head_refresh.as_ref();
+    let rows = [
+        ("Discovered", Some(r.reconcile.discovered)),
+        ("Recorded", Some(r.reconcile.recorded)),
+        ("Inaccessible", Some(r.reconcile.inaccessible)),
+        ("Targeted", h.map(|h| h.targeted)),
+        ("Observed", h.map(|h| h.observed)),
+        ("Changed", h.map(|h| h.changed)),
+    ];
+    let w = rows
+        .iter()
+        .map(|(_, v)| v.map_or(1, |v| v.to_string().len()))
+        .max()
+        .unwrap_or(1)
+        .max(3);
+    out.push('\n');
+    for (k, v) in rows {
+        let v = v.map_or(ABSENT.to_string(), |v| v.to_string());
+        out.push_str(&format!("{k:<13}{v:>w$}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +345,49 @@ mod tests {
         r.topics = None;
         let out = repositories(&[r]);
         assert!(out.lines().nth(1).unwrap().contains("—"), "{out}");
+    }
+
+    #[test]
+    fn sync_matches_the_readme() {
+        let now = Utc::now();
+        let connection_id = ConnectionId::new();
+        let r = Sync {
+            id: "syn_06G9N0B1C2D3E4F5G6H7J8K9MN".parse().unwrap(),
+            connection_id,
+            status: RunStatus::Succeeded,
+            error: None,
+            reconcile: Reconcile {
+                id: "rec_06G9N084KXVH9BQD3DW01R4TA4".parse().unwrap(),
+                connection_id,
+                status: RunStatus::Succeeded,
+                discovered: 6,
+                recorded: 6,
+                inaccessible: 0,
+                error: None,
+                requested_at: now,
+                started_at: None,
+                finished_at: None,
+            },
+            head_refresh: Some(HeadRefresh {
+                id: "hrf_06G9N0A2QPZ3M4X5Y6T7V8W9RS".parse().unwrap(),
+                connection_id,
+                status: RunStatus::Succeeded,
+                targeted: 6,
+                observed: 6,
+                changed: 6,
+                error: None,
+                requested_at: now,
+                started_at: None,
+                finished_at: None,
+            }),
+            requested_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+                .unwrap();
+        let out = sync(&r);
+        assert!(readme.contains(&out), "README does not show:\n{out}");
     }
 }

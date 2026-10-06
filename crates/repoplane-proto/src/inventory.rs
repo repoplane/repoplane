@@ -61,3 +61,11 @@ pub struct UnseenRepo {
     pub external_id: String,
     pub full_name: String,
 }
+
+/// The head refresh a sync goes on to, and whether it has anything to read: with no active
+/// repository it is finished as it is created, and there is no workflow to run.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SyncHeads {
+    pub refresh: crate::id::HeadRefreshId,
+    pub queued: bool,
+}

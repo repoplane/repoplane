@@ -32,6 +32,7 @@ kinds! {
     Rep => "rep",
     Rec => "rec",
     Hrf => "hrf",
+    Syn => "syn",
 }
 
 pub type OrgId = Id<Org>;
@@ -39,6 +40,7 @@ pub type ConnectionId = Id<Con>;
 pub type RepositoryId = Id<Rep>;
 pub type ReconcileId = Id<Rec>;
 pub type HeadRefreshId = Id<Hrf>;
+pub type SyncId = Id<Syn>;
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub struct Id<K: Kind> {

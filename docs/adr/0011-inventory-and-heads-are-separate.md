@@ -1,6 +1,6 @@
 # 11. Inventory and HEADs are separate operations
 
-**Status:** New · 2026-10-01; runs are workflows (ADR 0012)
+**Status:** New · 2026-10-01; runs are workflows (ADR 0012); composed by `connection sync` (ADR 0013)
 
 ## Context
 

@@ -4,9 +4,11 @@
 
 use std::sync::Arc;
 
-use repoplane_flow::activities::{ReconcileFailed, RecordHeads, RecordPage, RefreshFailed};
-use repoplane_proto::id::{HeadRefreshId, ReconcileId};
-use repoplane_proto::inventory::{HeadTarget, UnseenRepo};
+use repoplane_flow::activities::{
+    ReconcileFailed, RecordHeads, RecordPage, RefreshFailed, SyncFailed,
+};
+use repoplane_proto::id::{HeadRefreshId, ReconcileId, SyncId};
+use repoplane_proto::inventory::{HeadTarget, SyncHeads, UnseenRepo};
 use repoplane_store::{Store, StoreError};
 use temporalio_macros::activities;
 use temporalio_sdk::ApplicationFailure;
@@ -120,6 +122,45 @@ impl ControlActivities {
     ) -> Result<(), ActivityError> {
         self.store
             .fail_refresh(input.refresh, &input.message)
+            .await
+            .map_err(failure)
+    }
+
+    #[activity(definition = repoplane_flow::activities::control_defs::StartSync)]
+    pub async fn start_sync(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        id: SyncId,
+    ) -> Result<(), ActivityError> {
+        self.store.start_sync(id).await.map_err(failure)
+    }
+
+    #[activity(definition = repoplane_flow::activities::control_defs::SyncHeads)]
+    pub async fn sync_heads(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        id: SyncId,
+    ) -> Result<SyncHeads, ActivityError> {
+        self.store.sync_heads(id).await.map_err(failure)
+    }
+
+    #[activity(definition = repoplane_flow::activities::control_defs::FinishSync)]
+    pub async fn finish_sync(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        id: SyncId,
+    ) -> Result<(), ActivityError> {
+        self.store.finish_sync(id).await.map_err(failure)
+    }
+
+    #[activity(definition = repoplane_flow::activities::control_defs::FailSync)]
+    pub async fn fail_sync(
+        self: Arc<Self>,
+        _ctx: ActivityContext,
+        input: SyncFailed,
+    ) -> Result<(), ActivityError> {
+        self.store
+            .fail_sync(input.sync, &input.message)
             .await
             .map_err(failure)
     }

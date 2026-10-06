@@ -12,3 +12,4 @@
 - [10. Webhooks are the fast path; reconciliation is the correctness path](0010-webhooks-fast-path-reconcile-correctness.md): New
 - [11. Inventory and HEADs are separate operations](0011-inventory-and-heads-are-separate.md): New
 - [12. Temporal orchestrates; Postgres is product state](0012-temporal-orchestrates.md): New
+- [13. `connection sync` composes the runs; fan-out stays within Temporal's limits](0013-sync-and-fan-out-within-temporal-limits.md): New

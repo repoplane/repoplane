@@ -7,21 +7,35 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use temporalio_macros::{workflow, workflow_methods};
-use temporalio_sdk::{ActivityOptions, WorkflowContext, WorkflowResult};
-use temporalio_workflow::common::error::{ActivityExecutionError, ApplicationFailure};
+use temporalio_sdk::{ActivityOptions, ChildWorkflowOptions, WorkflowContext, WorkflowResult};
+use temporalio_workflow::common::error::{
+    ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
+    ChildWorkflowStartError,
+};
+use temporalio_workflow::common::protos::temporal::api::failure::v1::Failure;
 use temporalio_workflow::{RetryPolicy, WorkflowTermination, join_all};
 
 use repoplane_proto::inventory::ConnectionSpec;
 
 use crate::activities::{
     Control, Forge, ListPage, Lookup, ReadHead, ReconcileFailed, RecordHeads, RecordPage,
-    RefreshFailed,
+    RefreshFailed, SyncFailed,
 };
-use crate::{CONTROL_QUEUE, ReconcileInput, RefreshHeadsInput};
+use crate::{
+    CONTROL_QUEUE, LookupsInput, ReadHeadsInput, ReconcileInput, RefreshHeadsInput, SyncInput,
+    workflow_id,
+};
 
-// No batch sizes and no waves: the workflow schedules every page, lookup and HEAD read at once,
-// and the worker's activity slots (`concurrency`) decide how many run at a time. Each is retried
-// on its own by the forge retry policy below.
+// No batch sizes for speed: a workflow schedules its pages, lookups and HEAD reads at once, and
+// the worker's activity slots (`concurrency`) decide how many run at a time. Each is retried on
+// its own by the forge retry policy below.
+
+/// Most activities one workflow schedules at once. Temporal refuses more than 2,000 pending
+/// activities per workflow (its server default, and Temporal Cloud's): a refresh of 2,139
+/// repositories scheduled at once failed its workflow task, which Temporal then retried forever.
+/// Lookups and HEAD reads beyond it go to child workflows of this many each; it is a limit to
+/// stay under, not a speed setting.
+const SLICE: usize = 1_000;
 
 /// A forge call. Its HTTP layer already waits out rate limits for up to ten minutes per
 /// request, so an attempt may take that long; between attempts Temporal backs off. A failure the
@@ -61,16 +75,35 @@ enum Stop {
     Failed(String),
 }
 
+impl Stop {
+    fn message(self) -> String {
+        let Stop::Failed(m) = self;
+        m
+    }
+}
+
 impl From<ActivityExecutionError> for Stop {
     fn from(e: ActivityExecutionError) -> Self {
-        Stop::Failed(describe(&e))
+        Stop::Failed(describe(e.failure(), &e))
+    }
+}
+
+impl From<ChildWorkflowExecutionError> for Stop {
+    fn from(e: ChildWorkflowExecutionError) -> Self {
+        Stop::Failed(describe(e.failure(), &e))
+    }
+}
+
+impl From<ChildWorkflowStartError> for Stop {
+    fn from(e: ChildWorkflowStartError) -> Self {
+        Stop::Failed(e.to_string())
     }
 }
 
 /// The message of a failure and of every cause under it: the top level only says that an
-/// activity failed, and the forge's own words are underneath.
-fn describe(e: &ActivityExecutionError) -> String {
-    let Some(mut f) = e.failure() else {
+/// activity (or a child workflow) failed, and the forge's own words are underneath.
+fn describe(top: Option<&Failure>, e: &dyn std::fmt::Display) -> String {
+    let Some(mut f) = top else {
         return e.to_string();
     };
     let mut parts = vec![f.message.clone()];
@@ -140,19 +173,21 @@ async fn reconcile(
         // The forge said how many pages there are: fetch them all at once, then record them one
         // after another (pages recorded at once would contend for the same rows).
         Some(cursors) => {
-            let pages = join_all(cursors.into_iter().map(|cursor| {
-                ctx.execute_activity(
-                    Forge::list_page,
-                    ListPage {
-                        connection: c.clone(),
-                        cursor: Some(cursor),
-                    },
-                    forge(c),
-                )
-            }))
-            .await;
-            for page in pages {
-                record(ctx, input, page?.repos).await?;
+            for wave in cursors.chunks(SLICE) {
+                let pages = join_all(wave.iter().map(|cursor| {
+                    ctx.execute_activity(
+                        Forge::list_page,
+                        ListPage {
+                            connection: c.clone(),
+                            cursor: Some(cursor.clone()),
+                        },
+                        forge(c),
+                    )
+                }))
+                .await;
+                for page in pages {
+                    record(ctx, input, page?.repos).await?;
+                }
             }
         }
         // It did not: follow the listing one page at a time.
@@ -187,12 +222,80 @@ async fn reconcile(
     let unseen = ctx
         .execute_activity(Control::unseen, input.reconcile, control())
         .await?;
-    let found = join_all(unseen.into_iter().map(|u| {
+    let ids: Vec<String> = unseen.into_iter().map(|u| u.external_id).collect();
+    let slices = ids.chunks(SLICE).enumerate().map(|(k, ids)| {
+        ctx.start_child_workflow(
+            LookupsWorkflow::run,
+            LookupsInput {
+                reconcile: input.reconcile,
+                connection: c.clone(),
+                ids: ids.to_vec(),
+            },
+            ChildWorkflowOptions::workflow_id(format!("{}-lookups-{}", input.reconcile, k + 1)),
+        )
+    });
+    let mut running = Vec::new();
+    for started in join_all(slices).await {
+        running.push(started?.result());
+    }
+    for done in join_all(running).await {
+        done?;
+    }
+    ctx.execute_activity(Control::finish_reconcile, input.reconcile, control())
+        .await?;
+    Ok(())
+}
+
+/// Records listed repositories, if there are any.
+async fn record<W>(
+    ctx: &WorkflowContext<W>,
+    input: &ReconcileInput,
+    repos: Vec<repoplane_proto::inventory::RepoSnapshot>,
+) -> Result<(), Stop> {
+    record_for(ctx, input.reconcile, repos).await
+}
+
+async fn record_for<W>(
+    ctx: &WorkflowContext<W>,
+    reconcile: repoplane_proto::id::ReconcileId,
+    repos: Vec<repoplane_proto::inventory::RepoSnapshot>,
+) -> Result<(), Stop> {
+    if !repos.is_empty() {
+        ctx.execute_activity(
+            Control::record_page,
+            RecordPage { reconcile, repos },
+            control(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// One slice of a reconcile's lookups (at most [`SLICE`]): each id looked up at once, and the
+/// repositories still there recorded. The parent records the failure if it fails.
+#[workflow]
+#[derive(Default)]
+pub struct LookupsWorkflow;
+
+#[workflow_methods]
+impl LookupsWorkflow {
+    #[run(name = "reconcile-lookups")]
+    pub async fn run(ctx: &mut WorkflowContext<Self>, input: LookupsInput) -> WorkflowResult<()> {
+        lookups(ctx, input).await.map_err(|Stop::Failed(m)| fail(m))
+    }
+}
+
+async fn lookups(
+    ctx: &mut WorkflowContext<LookupsWorkflow>,
+    input: LookupsInput,
+) -> Result<(), Stop> {
+    let c = &input.connection;
+    let found = join_all(input.ids.iter().map(|id| {
         ctx.execute_activity(
             Forge::lookup,
             Lookup {
                 connection: c.clone(),
-                id: u.external_id,
+                id: id.clone(),
             },
             forge(c),
         )
@@ -202,34 +305,12 @@ async fn reconcile(
     for f in found {
         still_there.extend(f?);
     }
-    record(ctx, input, still_there).await?;
-    ctx.execute_activity(Control::finish_reconcile, input.reconcile, control())
-        .await?;
-    Ok(())
-}
-
-/// Records listed repositories, if there are any.
-async fn record(
-    ctx: &WorkflowContext<ReconcileWorkflow>,
-    input: &ReconcileInput,
-    repos: Vec<repoplane_proto::inventory::RepoSnapshot>,
-) -> Result<(), Stop> {
-    if !repos.is_empty() {
-        ctx.execute_activity(
-            Control::record_page,
-            RecordPage {
-                reconcile: input.reconcile,
-                repos,
-            },
-            control(),
-        )
-        .await?;
-    }
-    Ok(())
+    record_for(ctx, input.reconcile, still_there).await
 }
 
 /// `repo refresh-heads`: reads the default-branch HEAD of the repositories the refresh was
-/// given, in batches, and records them. Lists nothing, changes nothing but HEADs.
+/// given and records them, in child workflows of at most [`SLICE`] repositories that all run at
+/// once. Lists nothing, changes nothing but HEADs.
 #[workflow]
 #[derive(Default)]
 pub struct RefreshHeadsWorkflow;
@@ -268,7 +349,51 @@ async fn refresh(
     let targets = ctx
         .execute_activity(Control::start_refresh, input.refresh, control())
         .await?;
-    let reads = join_all(targets.into_iter().map(|target| {
+    let slices = targets.chunks(SLICE).enumerate().map(|(k, targets)| {
+        ctx.start_child_workflow(
+            ReadHeadsWorkflow::run,
+            ReadHeadsInput {
+                refresh: input.refresh,
+                connection: c.clone(),
+                targets: targets.to_vec(),
+            },
+            ChildWorkflowOptions::workflow_id(format!("{}-heads-{}", input.refresh, k + 1)),
+        )
+    });
+    let mut running = Vec::new();
+    for started in join_all(slices).await {
+        running.push(started?.result());
+    }
+    for done in join_all(running).await {
+        done?;
+    }
+    ctx.execute_activity(Control::finish_refresh, input.refresh, control())
+        .await?;
+    Ok(())
+}
+
+/// One slice of a head refresh (at most [`SLICE`] targets): every HEAD read at once, then
+/// recorded. The parent records the failure if it fails.
+#[workflow]
+#[derive(Default)]
+pub struct ReadHeadsWorkflow;
+
+#[workflow_methods]
+impl ReadHeadsWorkflow {
+    #[run(name = "refresh-heads-slice")]
+    pub async fn run(ctx: &mut WorkflowContext<Self>, input: ReadHeadsInput) -> WorkflowResult<()> {
+        read_heads(ctx, input)
+            .await
+            .map_err(|Stop::Failed(m)| fail(m))
+    }
+}
+
+async fn read_heads(
+    ctx: &mut WorkflowContext<ReadHeadsWorkflow>,
+    input: ReadHeadsInput,
+) -> Result<(), Stop> {
+    let c = &input.connection;
+    let reads = join_all(input.targets.into_iter().map(|target| {
         ctx.execute_activity(
             Forge::read_head,
             ReadHead {
@@ -291,7 +416,79 @@ async fn refresh(
         )
         .await?;
     }
-    ctx.execute_activity(Control::finish_refresh, input.refresh, control())
+    Ok(())
+}
+
+/// `connection sync`: a reconcile, then a head refresh of every repository it left active, each
+/// as a child workflow under its own run id, so each step is a run of its own too, readable and
+/// recorded as when it is run alone. A step that fails has recorded why; the sync records it
+/// again, as the reason the sync stopped.
+#[workflow]
+#[derive(Default)]
+pub struct SyncWorkflow;
+
+#[workflow_methods]
+impl SyncWorkflow {
+    #[run(name = "sync")]
+    pub async fn run(ctx: &mut WorkflowContext<Self>, input: SyncInput) -> WorkflowResult<()> {
+        match sync(ctx, &input).await {
+            Ok(()) => Ok(()),
+            Err(Stop::Failed(message)) => {
+                let _ = ctx
+                    .execute_activity(
+                        Control::fail_sync,
+                        SyncFailed {
+                            sync: input.sync,
+                            message: message.clone(),
+                        },
+                        control(),
+                    )
+                    .await;
+                Err(fail(message))
+            }
+        }
+    }
+}
+
+async fn sync(ctx: &mut WorkflowContext<SyncWorkflow>, input: &SyncInput) -> Result<(), Stop> {
+    let c = &input.connection;
+    ctx.execute_activity(Control::start_sync, input.sync, control())
+        .await?;
+    ctx.start_child_workflow(
+        ReconcileWorkflow::run,
+        ReconcileInput {
+            reconcile: input.reconcile,
+            connection: c.clone(),
+        },
+        ChildWorkflowOptions::workflow_id(workflow_id(&input.reconcile)),
+    )
+    .await?
+    .result()
+    .await
+    .map_err(|e| Stop::Failed(format!("the reconcile failed: {}", Stop::from(e).message())))?;
+    let heads = ctx
+        .execute_activity(Control::sync_heads, input.sync, control())
+        .await?;
+    if heads.queued {
+        ctx.start_child_workflow(
+            RefreshHeadsWorkflow::run,
+            RefreshHeadsInput {
+                refresh: heads.refresh,
+                connection: c.clone(),
+            },
+            ChildWorkflowOptions::workflow_id(workflow_id(&heads.refresh)),
+        )
+        .await?
+        .result()
+        .await
+        .map_err(|e| {
+            Stop::Failed(format!(
+                "the head refresh failed: {}",
+                Stop::from(e).message()
+            ))
+        })?;
+    }
+    ctx.execute_activity(Control::finish_sync, input.sync, control())
         .await?;
     Ok(())
 }

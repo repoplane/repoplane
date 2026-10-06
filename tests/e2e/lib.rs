@@ -617,6 +617,25 @@ impl Stack {
         Ok(handle.fetch_history(Default::default()).to_json().await?)
     }
 
+    /// Terminates a workflow, as an operator would from the Temporal UI.
+    pub async fn terminate(&self, workflow_id: &str, reason: &str) -> anyhow::Result<()> {
+        let client = repoplane_flow::TemporalConfig {
+            address: self.temporal.clone(),
+            ..Default::default()
+        }
+        .connect("repoplane-e2e")
+        .await?;
+        client
+            .get_workflow_handle::<temporalio_client::UntypedWorkflow>(workflow_id)
+            .terminate(
+                temporalio_client::WorkflowTerminateOptions::builder()
+                    .reason(reason)
+                    .build(),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Starts the worker: the forge token in its environment, Temporal as its only peer.
     pub async fn start_worker(&self) -> anyhow::Result<()> {
         let log = std::fs::OpenOptions::new()
@@ -663,6 +682,23 @@ impl Stack {
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    /// Like [`Stack::cli_json`], for a command expected to exit non-zero (`--wait` on a run that
+    /// fails): its output is read whatever the exit status.
+    pub async fn cli_json_failing<T: DeserializeOwned>(&self, args: &[&str]) -> anyhow::Result<T> {
+        let mut a = args.to_vec();
+        a.extend(["--output", "json"]);
+        let out = Command::new(self.bin.join("repoplane"))
+            .args(&a)
+            .env("REPOPLANE_CONFIG", "/nonexistent/repoplane-e2e.yaml")
+            .env("REPOPLANE_API_URL", &self.api_url)
+            .env("REPOPLANE_TOKEN", &self.admin_token)
+            .output()
+            .await?;
+        let raw = String::from_utf8_lossy(&out.stdout);
+        serde_json::from_str(&raw)
+            .with_context(|| format!("decode: {raw}{}", String::from_utf8_lossy(&out.stderr)))
     }
 
     pub async fn cli_json<T: DeserializeOwned>(&self, args: &[&str]) -> anyhow::Result<T> {

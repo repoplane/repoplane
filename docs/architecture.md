@@ -85,27 +85,28 @@ Campaigns will need all of this: waiting for merges, waves, pausing.
 
 | Component | Responsibility |
 |---|---|
-| `http` (`/v1`) | connections, reconciles and head refreshes (each with `?wait=` long-poll on Postgres), repositories (filtered, keyset-paged). Admin bearer token. Asking for a run records it, then starts its workflow; if Temporal will not take it, the run is recorded failed and the call answers 503. |
+| `http` (`/v1`) | connections, reconciles, head refreshes and syncs (each with `?wait=` long-poll on Postgres), repositories (filtered, keyset-paged). Admin bearer token. Asking for a run records it, then starts its workflow; if Temporal will not take it, the run is recorded failed and the call answers 503. Serving a run still in flight, it asks Temporal about its workflow and records the run as failed if the workflow closed without recording it, is gone, or has a workflow task that keeps failing (ADR 0013). |
 | `control` | the Postgres activities: one store call each, safe to repeat; a refusal from the store is non-retryable |
-| control worker | Temporal worker on `repoplane-control`, hosting `ReconcileWorkflow` and `RefreshHeadsWorkflow` and the control activities; it shares the process and the shutdown with the HTTP server |
+| control worker | Temporal worker on `repoplane-control`, hosting the workflows and the control activities; it shares the process and the shutdown with the HTTP server |
 | `store` | run steps (`start_*`, `record_*`, `unseen`, `finish_*`, `fail_*`), the inventory upsert (identity by forge id, watermark, never delete), migrations |
 
 ### repoplane-flow (the workflows)
 
 | Workflow | Steps |
 |---|---|
-| `ReconcileWorkflow` (`connection reconcile`) | `start_reconcile` → `list_page` for the first page → `record_page`. If that page said how many pages there are, every other page is scheduled at once; otherwise they are walked one by one. Pages are recorded one after another either way. Then `unseen` → one `lookup` by id per unseen repository, all at once → `record_page` for the ones still there → `finish_reconcile`, which marks the rest inaccessible. Marking happens only after the whole listing and the lookups succeeded (ADR 0005). |
-| `RefreshHeadsWorkflow` (`repo refresh-heads`) | `start_refresh` (targets fixed at request) → one `read_head` per target, all at once → `record_heads` (target-scoped, branch-guarded, each target counted once) → `finish_refresh` |
+| `ReconcileWorkflow` (`connection reconcile`) | `start_reconcile` → `list_page` for the first page → `record_page`. If that page said how many pages there are, every other page is scheduled at once; otherwise they are walked one by one. Pages are recorded one after another either way. Then `unseen` → `LookupsWorkflow` children of at most 1,000 ids, all at once, each looking up every id at once and recording the ones still there → `finish_reconcile`, which marks the rest inaccessible. Marking happens only after the whole listing and the lookups succeeded (ADR 0005). |
+| `RefreshHeadsWorkflow` (`repo refresh-heads`) | `start_refresh` (targets fixed at request) → `ReadHeadsWorkflow` children of at most 1,000 targets, all at once, each with one `read_head` per target at once, then `record_heads` (target-scoped, branch-guarded, each target counted once) → `finish_refresh` |
+| `SyncWorkflow` (`connection sync`) | `start_sync` → `ReconcileWorkflow` as a child, under the reconcile's run id → `sync_heads` (requests a refresh of every active repository, once) → `RefreshHeadsWorkflow` as a child, under the refresh's run id → `finish_sync`. A failing step fails the sync with the step's reason (ADR 0013). |
 
-Workflows size no batches. They schedule every page, lookup and HEAD read at once, and the
-worker's activity slots (`concurrency`, 32 by default) are the only bound on how many run at a
-time: Temporal hands a worker as many tasks as it has free slots. Each forge step is retried on
-its own, so one repository the forge could not answer for is retried alone.
+Workflows size no batches for speed. They schedule every page, lookup and HEAD read at once,
+and the worker's activity slots (`concurrency`, 32 by default) are the only bound on how many
+run at a time: Temporal hands a worker as many tasks as it has free slots. Each forge step is
+retried on its own, so one repository the forge could not answer for is retried alone.
 
-The cost is workflow history: about three events per activity, so a head refresh of N
-repositories is about 3N events. Temporal warns at 10,240 events and stops a workflow at 51,200,
-which puts a single refresh's ceiling near 17,000 repositories. Beyond that, the Temporal answer
-is child workflows over slices of the targets; it is not built yet.
+Temporal refuses more than 2,000 pending activities per workflow, so lookups and HEAD reads go
+to child workflows of at most 1,000 each (ADR 0013). This was measured: 2,139 HEAD reads
+scheduled in one workflow stalled it. A child's history is about 4,000 events per 1,000
+repositories, well under Temporal's 51,200.
 
 Forge steps retry 8 times, backing off from 1s to 60s. A failure the worker marks non-retryable
 (a refused token, a missing variable, a protocol violation) fails the run at once. The run's
@@ -254,7 +255,8 @@ expected.
 
 ## Known gaps
 
-- Listing pages are fetched one after another. For fleets in the thousands, planned page
-  fan-out (the Go draft's approach) comes later, as will continue-as-new for very long runs.
+- A reconcile's history carries every page it recorded: about 1.8 MB for 2,139 repositories,
+  against Temporal's 50 MB per workflow. Organisations past a few tens of thousands of
+  repositories will need the listing in child workflows or continue-as-new.
 - Workers serving the same namespace can poll each other's queues; Temporal Cloud namespaces
   (one per tenant) are the boundary. Per-queue authorisation would need Temporal's own.

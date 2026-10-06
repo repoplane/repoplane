@@ -12,6 +12,19 @@ changes verified by re-evaluation rather than by counting merged pull requests.
 $ repoplane connection add forgejo --name lab --org acme-services \
     --auth token --token-env FORGEJO_TOKEN --base-url http://localhost:3000
 
+$ repoplane connection sync lab --wait
+Sync        syn_06G9N0B1C2D3E4F5G6H7J8K9MN
+Status      succeeded
+Reconcile   rec_06G9N084KXVH9BQD3DW01R4TA4 succeeded
+Refresh     hrf_06G9N0A2QPZ3M4X5Y6T7V8W9RS succeeded
+
+Discovered     6
+Recorded       6
+Inaccessible   0
+Targeted       6
+Observed       6
+Changed        6
+
 $ repoplane connection reconcile lab --wait
 Reconcile   rec_06G9N084KXVH9BQD3DW01R4TA4
 Status      succeeded
@@ -36,7 +49,8 @@ acme-services/ledger-worker   main     false      1833865b   node service
 acme-services/node-gateway    main     false      568a26e9   gateway node service
 ```
 
-Two operations, each doing one thing:
+`connection sync` is the everyday command: a reconcile, then a head refresh of every repository
+it left active, as one run. Each step is also a command of its own:
 
 - **`connection reconcile`** records *what exists*. *Discovered* is what the forge listed.
   *Recorded* is what changed in the inventory, so a second run with nothing changed records 0.

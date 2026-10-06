@@ -18,12 +18,14 @@ mod workflows;
 
 pub use activities::{Control, Forge};
 pub use temporal::{TemporalConfig, TemporalError};
-pub use workflows::{ReconcileWorkflow, RefreshHeadsWorkflow};
+pub use workflows::{
+    LookupsWorkflow, ReadHeadsWorkflow, ReconcileWorkflow, RefreshHeadsWorkflow, SyncWorkflow,
+};
 
 use serde::{Deserialize, Serialize};
 
-use repoplane_proto::id::{HeadRefreshId, ReconcileId};
-use repoplane_proto::inventory::ConnectionSpec;
+use repoplane_proto::id::{HeadRefreshId, ReconcileId, SyncId};
+use repoplane_proto::inventory::{ConnectionSpec, HeadTarget};
 
 /// The task queue of `repoplane-api`'s control worker: workflows and Postgres activities.
 pub const CONTROL_QUEUE: &str = "repoplane-control";
@@ -38,6 +40,30 @@ pub struct ReconcileInput {
 pub struct RefreshHeadsInput {
     pub refresh: HeadRefreshId,
     pub connection: ConnectionSpec,
+}
+
+/// `connection sync`: the reconcile it runs first was recorded with it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncInput {
+    pub sync: SyncId,
+    pub reconcile: ReconcileId,
+    pub connection: ConnectionSpec,
+}
+
+/// One slice of a reconcile's lookups by id, run as a child workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LookupsInput {
+    pub reconcile: ReconcileId,
+    pub connection: ConnectionSpec,
+    pub ids: Vec<String>,
+}
+
+/// One slice of a head refresh's targets, run as a child workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadHeadsInput {
+    pub refresh: HeadRefreshId,
+    pub connection: ConnectionSpec,
+    pub targets: Vec<HeadTarget>,
 }
 
 /// The workflow id of a run: its domain id, so a run is found in Temporal by the id the API

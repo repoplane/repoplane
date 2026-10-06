@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::forge::ForgeKind;
-use crate::id::{ConnectionId, HeadRefreshId, ReconcileId, RepositoryId};
+use crate::id::{ConnectionId, HeadRefreshId, ReconcileId, RepositoryId, SyncId};
 
 /// How a connection authenticates to its forge. Day 0 knows one way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +156,21 @@ pub struct HeadRefresh {
     /// Repositories whose HEAD differs from the one recorded before.
     pub changed: i64,
     pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// `connection sync`: a reconcile, then a head refresh of every active repository, as one run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Sync {
+    pub id: SyncId,
+    pub connection_id: ConnectionId,
+    pub status: RunStatus,
+    pub error: Option<String>,
+    pub reconcile: Reconcile,
+    /// Absent until the reconcile has succeeded and the refresh is requested.
+    pub head_refresh: Option<HeadRefresh>,
     pub requested_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,

@@ -6,7 +6,9 @@
 //! The histories are real runs, recorded by the end-to-end suite:
 //!   REPOPLANE_RECORD_HISTORIES=1 make e2e
 
-use repoplane_flow::{ReconcileWorkflow, RefreshHeadsWorkflow};
+use repoplane_flow::{
+    LookupsWorkflow, ReadHeadsWorkflow, ReconcileWorkflow, RefreshHeadsWorkflow, SyncWorkflow,
+};
 use temporalio_client::WorkflowHistory;
 use temporalio_sdk::workflow_replayer::{WorkflowReplayer, WorkflowReplayerOptions};
 
@@ -25,6 +27,12 @@ async fn recorded_histories_replay() {
             .register_workflow::<ReconcileWorkflow>()
             .unwrap()
             .register_workflow::<RefreshHeadsWorkflow>()
+            .unwrap()
+            .register_workflow::<LookupsWorkflow>()
+            .unwrap()
+            .register_workflow::<ReadHeadsWorkflow>()
+            .unwrap()
+            .register_workflow::<SyncWorkflow>()
             .unwrap()
             .build(),
     )

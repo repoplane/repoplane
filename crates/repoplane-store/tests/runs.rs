@@ -28,6 +28,8 @@ async fn runs() {
     heads_outside_the_targets_are_ignored(&store).await;
     finishing_a_reconcile_marks_what_it_did_not_see_once(&store).await;
     a_late_failure_does_not_undo_a_success(&store).await;
+    a_sync_requests_its_refresh_once(&store).await;
+    a_failed_sync_fails_the_step_in_flight(&store).await;
 }
 
 async fn start() -> (ContainerAsync<GenericImage>, Store) {
@@ -297,5 +299,59 @@ async fn a_late_failure_does_not_undo_a_success(store: &Store) {
     assert_eq!(
         store.reconcile(r.id).await.unwrap().status,
         RunStatus::Succeeded
+    );
+}
+
+/// `sync_heads` may run again after its commit (Temporal retries an activity it did not hear
+/// back from): it must hand back the refresh it already requested, not request a second.
+async fn a_sync_requests_its_refresh_once(store: &Store) {
+    let c = connection(store, "sync-once").await;
+    reconcile(store, &c, &[repo("1", "main", &[]), repo("2", "main", &[])]).await;
+    let (r, created) = store.request_reconcile(&c).await.unwrap();
+    assert!(created);
+    let sync = store.create_sync(&c, r.id).await.unwrap();
+    store.start_sync(sync.id).await.unwrap();
+    let first = store.sync_heads(sync.id).await.unwrap();
+    let again = store.sync_heads(sync.id).await.unwrap();
+    assert_eq!(first.refresh, again.refresh);
+    assert!(first.queued);
+    let s = store.sync(sync.id).await.unwrap();
+    assert_eq!(s.head_refresh.unwrap().targeted, 2);
+}
+
+/// Temporal ends a sync's child workflows when the sync closes, so a step in flight never
+/// records itself: failing the sync fails it too, and leaves a step that succeeded alone.
+async fn a_failed_sync_fails_the_step_in_flight(store: &Store) {
+    let c = connection(store, "sync-fail").await;
+    reconcile(store, &c, &[repo("1", "main", &[])]).await;
+    let (r, _) = store.request_reconcile(&c).await.unwrap();
+    let sync = store.create_sync(&c, r.id).await.unwrap();
+    store.start_sync(sync.id).await.unwrap();
+    store.start_reconcile(r.id).await.unwrap();
+    store
+        .record_page(r.id, &[repo("1", "main", &[])])
+        .await
+        .unwrap();
+    store.finish_reconcile(r.id).await.unwrap();
+    let heads = store.sync_heads(sync.id).await.unwrap();
+    assert!(heads.queued);
+    store.start_refresh(heads.refresh).await.unwrap();
+    store
+        .fail_sync(sync.id, "the workflow was terminated")
+        .await
+        .unwrap();
+    let s = store.sync(sync.id).await.unwrap();
+    assert_eq!(s.status, RunStatus::Failed);
+    assert_eq!(s.error.as_deref(), Some("the workflow was terminated"));
+    assert_eq!(
+        s.reconcile.status,
+        RunStatus::Succeeded,
+        "a finished step stays as it was"
+    );
+    let h = s.head_refresh.unwrap();
+    assert_eq!(h.status, RunStatus::Failed);
+    assert_eq!(
+        h.error.as_deref(),
+        Some("the sync stopped: the workflow was terminated")
     );
 }
