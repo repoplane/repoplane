@@ -1,14 +1,14 @@
 # 12. Temporal orchestrates; Postgres is product state
 
-**Status:** New · 2026-10-01 · supersedes [0008](0008-http-task-queues.md)
+**Status:** Accepted · 2026-10-01
 
 ## Context
 
 Repoplane's runs are long, can fail and need to be retried, and soon will wait: for a merge, a
 review, the next wave of a campaign, a person's go-ahead. That is Temporal's job, and the
-official Rust SDK (`temporalio-sdk` / `temporalio-client` 1.0) supports it. A home-made Postgres
-task queue (ADR 0008) covered leases and retries for a single short run, and would have had to
-grow timers, signals and durable history to go further — badly.
+official Rust SDK (`temporalio-sdk` / `temporalio-client` 1.0) supports it. A queue built on a
+Postgres table would have to grow leases, retries, timers, signals and durable history: Temporal
+again, done worse.
 
 ## Decision
 
@@ -30,7 +30,7 @@ grow timers, signals and durable history to go further — badly.
 
 - An install needs a Temporal: the CLI dev server for development (`make up`), a Temporal
   cluster or Temporal Cloud in production.
-- The worker no longer calls the repoplane API at all; it reaches Temporal and forges only.
+- The worker never calls the repoplane API; it reaches Temporal and forges only.
 - Runs survive any process dying. Retries back off. A non-retryable forge failure (a refused
   token) fails the run at once, with the forge's message.
 - Queue-level isolation is Temporal's: workers sharing a namespace can poll each other's queues,

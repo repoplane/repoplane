@@ -1,6 +1,6 @@
 # 6. Schema migrations are an explicit deployment step
 
-**Status:** Kept · 2026-09-30
+**Status:** Accepted · 2026-09-30
 
 ## Context
 

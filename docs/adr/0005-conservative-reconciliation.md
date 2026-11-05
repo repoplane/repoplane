@@ -1,6 +1,6 @@
 # 5. Inventory reconciliation is conservative
 
-**Status:** Kept; the offset-pagination gap closed; steps are workflow activities · 2026-10-01
+**Status:** Accepted · 2026-10-01
 
 ## Context
 

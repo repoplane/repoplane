@@ -1,15 +1,14 @@
 # 11. Inventory and HEADs are separate operations
 
-**Status:** New · 2026-10-01; runs are workflows (ADR 0012); composed by `connection sync` (ADR 0013)
+**Status:** Accepted · 2026-10-01
 
 ## Context
 
-The first reconcile listed the organisation *and* read every default-branch HEAD. The listing
-costs one to three requests per organisation on GitHub, GitLab and Azure DevOps. The HEADs cost
-one request per repository on Forgejo, GitLab and Azure DevOps, and most of the run's time and
-rate budget. Yet a HEAD recorded at reconcile time is stale by the time a scan uses it. A scan
-has to resolve the exact commit it checks out anyway, and a scan of seventeen repositories
-should not pay for the other hundred.
+Listing an organisation costs one request per page of repositories. Reading default-branch
+HEADs costs one request per repository, and most of a run's time and rate budget. Yet a HEAD
+recorded at reconcile time is stale by the time a scan uses it. A scan has to resolve the exact
+commit it checks out anyway, and a scan of seventeen repositories should not pay for the other
+hundred.
 
 ## Decision
 

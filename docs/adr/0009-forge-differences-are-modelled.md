@@ -1,6 +1,6 @@
 # 9. Forge differences are modelled, not hidden
 
-**Status:** New · 2026-09-30
+**Status:** Accepted · 2026-09-30
 
 ## Context
 

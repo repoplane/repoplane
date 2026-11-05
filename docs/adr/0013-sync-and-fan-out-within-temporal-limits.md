@@ -1,6 +1,6 @@
 # 13. `connection sync` composes the runs; fan-out stays within Temporal's limits
 
-**Status:** New · 2026-10-05
+**Status:** Accepted · 2026-10-05
 
 ## Context
 

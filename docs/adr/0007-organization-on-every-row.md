@@ -1,6 +1,6 @@
 # 7. `organization_id` on every row from the first migration
 
-**Status:** Kept · 2026-09-30
+**Status:** Accepted · 2026-09-30
 
 ## Context
 

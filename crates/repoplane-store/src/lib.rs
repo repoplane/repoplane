@@ -1,5 +1,5 @@
 //! Postgres: the product state — connections, repositories, and the runs that fill them.
-//! workers lease from. Only the API links this crate; a worker never opens a database (ADR 0001).
+//! Only the API links this crate; a worker never opens a database (ADR 0001).
 
 mod heads;
 mod repos;

@@ -1,6 +1,6 @@
 # 3. The API holds no forge credential
 
-**Status:** Kept, to revisit with GitHub Apps; extended to workflow history · 2026-10-01
+**Status:** Accepted · 2026-10-01
 
 ## Context
 
