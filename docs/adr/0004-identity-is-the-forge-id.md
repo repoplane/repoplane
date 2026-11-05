@@ -1,6 +1,6 @@
 # 4. Repository identity is the forge's id, never the name
 
-**Status:** Kept · 2026-09-30
+**Status:** Accepted · 2026-09-30
 
 ## Context
 

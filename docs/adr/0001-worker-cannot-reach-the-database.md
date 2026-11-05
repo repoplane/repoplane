@@ -1,6 +1,6 @@
 # 1. The worker cannot reach the database
 
-**Status:** Kept; mechanism rewritten for Temporal · 2026-10-01
+**Status:** Accepted · 2026-10-01
 
 ## Context
 
@@ -11,8 +11,8 @@ customer runs inside its own network, possibly far from the API (the hybrid depl
 
 The worker has no database driver and no database credential. It runs the forge activities and
 returns what it found to Temporal; the workflows hand that to the Postgres activities, which run
-in `repoplane-api`. The worker no longer talks to the repoplane API either: its only peers are
-Temporal and the forges.
+in `repoplane-api`. Nor does the worker talk to the repoplane API: its only peers are Temporal
+and the forges.
 
 ## Consequences
 

@@ -1,6 +1,6 @@
 # 10. Webhooks are the fast path; reconciliation is the correctness path
 
-**Status:** New · 2026-09-30
+**Status:** Accepted · 2026-09-30
 
 ## Context
 
