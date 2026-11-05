@@ -1083,8 +1083,8 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forgelab"
-version = "0.14.0"
-source = "git+https://github.com/repoplane/forgelab?tag=v0.14.0#e7acbd3733e62724e0ef02946424e5361ffb6e0b"
+version = "0.15.0"
+source = "git+https://github.com/repoplane/forgelab?tag=v0.15.0#56c49e40a5b092f86556cd1ab7221b68417fd5e7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5051,7 +5051,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
