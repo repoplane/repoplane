@@ -54,7 +54,7 @@ impl Context {
         match std::env::var(&self.token_env) {
             Ok(t) if !t.is_empty() => Ok(t),
             _ => bail!(
-                "context {:?}: the environment variable {} is not set (export it with the API's admin token)",
+                "context {:?}: the environment variable {} is not set (export it with the API's token)",
                 self.name,
                 self.token_env
             ),

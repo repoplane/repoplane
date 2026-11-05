@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Serve => {
             store.check_schema().await?;
-            let admin_token = read_env(&cfg.admin.token_env)?;
+            let token = read_env(&cfg.token_env)?;
             let temporal = cfg
                 .temporal
                 .connect(&format!("repoplane-api@{}", hostname()))
@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
 
             let state = http::AppState {
                 store,
-                admin_token: Arc::new(admin_token),
+                token: Arc::new(token),
                 temporal,
             };
             let listener = tokio::net::TcpListener::bind(&cfg.listen)

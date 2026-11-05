@@ -411,7 +411,7 @@ async fn git(remote: &GitRemote, dir: &Path, args: &[&str]) -> anyhow::Result<St
 
 pub struct Stack {
     pub api_url: String,
-    admin_token: String,
+    api_token: String,
     bin: PathBuf,
     pub logs: PathBuf,
     /// The Temporal frontend, as `http://127.0.0.1:<port>`.
@@ -514,7 +514,7 @@ impl Stack {
         let (temporal_container, temporal) = start_temporal().await?;
         let db_url =
             format!("postgres://repoplane:repoplane-not-a-secret@127.0.0.1:{pg_port}/repoplane");
-        let admin_token = format!("admin-{}", uuid_like());
+        let api_token = format!("token-{}", uuid_like());
         let port = free_port()?;
         let api_url = format!("http://127.0.0.1:{port}");
         let logs = workspace_root().join("target/e2e-logs");
@@ -525,7 +525,7 @@ impl Stack {
             cmd.env_clear()
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default())
                 .env("REPOPLANE_DATABASE_URL", &db_url)
-                .env("REPOPLANE_ADMIN_TOKEN", &admin_token)
+                .env("REPOPLANE_TOKEN", &api_token)
                 .env("RUST_LOG", "info,sqlx=warn")
                 .current_dir(cfg_dir.path());
         };
@@ -587,7 +587,7 @@ impl Stack {
         drop(cfg_dir);
         let stack = Stack {
             api_url,
-            admin_token,
+            api_token,
             bin,
             logs,
             temporal,
@@ -670,7 +670,7 @@ impl Stack {
             .args(args)
             .env("REPOPLANE_CONFIG", "/nonexistent/repoplane-e2e.yaml")
             .env("REPOPLANE_API_URL", &self.api_url)
-            .env("REPOPLANE_TOKEN", &self.admin_token)
+            .env("REPOPLANE_TOKEN", &self.api_token)
             .output()
             .await?;
         if !out.status.success() {
@@ -693,7 +693,7 @@ impl Stack {
             .args(&a)
             .env("REPOPLANE_CONFIG", "/nonexistent/repoplane-e2e.yaml")
             .env("REPOPLANE_API_URL", &self.api_url)
-            .env("REPOPLANE_TOKEN", &self.admin_token)
+            .env("REPOPLANE_TOKEN", &self.api_token)
             .output()
             .await?;
         let raw = String::from_utf8_lossy(&out.stdout);

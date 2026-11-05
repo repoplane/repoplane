@@ -94,7 +94,7 @@ Needs Rust 1.93+ and Docker.
 ```sh
 make up build                  # Postgres :5432, Temporal :7233 (UI :8233), Forgejo :3000; the three binaries
 export REPOPLANE_DATABASE_URL=postgres://repoplane:repoplane-not-a-secret@127.0.0.1:5432/repoplane
-export REPOPLANE_ADMIN_TOKEN=dev-admin REPOPLANE_TOKEN=dev-admin
+export REPOPLANE_TOKEN=dev-token   # the API accepts it, the CLI sends it
 
 target/debug/repoplane-api migrate
 target/debug/repoplane-api serve &
@@ -113,7 +113,7 @@ id (`rec_…`, `hrf_…`).
 ## Secrets are named, never written
 
 Every credential is configured by the *name* of an environment variable: the API's database
-URL, admin token and Temporal Cloud API key ([`examples/repoplane-api.yaml`](examples/repoplane-api.yaml)); a
+URL, its token and Temporal Cloud API key ([`examples/repoplane-api.yaml`](examples/repoplane-api.yaml)); a
 connection's forge token (`--token-env`, read only by the worker); the CLI's API token
 ([`examples/contexts.yaml`](examples/contexts.yaml)). No flag takes a secret, and one pasted
 where a name belongs is refused.

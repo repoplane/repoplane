@@ -2,8 +2,7 @@
 # file itself never holds a secret. Every key is optional; these are the defaults.
 listen: 127.0.0.1:8080
 database_url_env: REPOPLANE_DATABASE_URL   # postgres://user:password@host:5432/db
-admin:
-  token_env: REPOPLANE_ADMIN_TOKEN         # the CLI's and the enterprise plane's bearer token
+token_env: REPOPLANE_TOKEN                 # the bearer token every client must send: the CLI's
 temporal:
   address: http://localhost:7233           # Temporal Cloud: https://<ns>.<account>.tmprl.cloud:7233
   namespace: default

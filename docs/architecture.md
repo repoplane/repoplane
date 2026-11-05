@@ -45,7 +45,7 @@ flowchart LR
     worker["<b>repoplane-worker</b><br/>Rust · Temporal activity worker"]
     forge["Forge APIs"]
 
-    cli -- "HTTPS /v1<br/>admin token" --> api
+    cli -- "HTTPS /v1<br/>bearer token" --> api
     api --- pg
     api -- "start workflows;<br/>serve queue repoplane-control" --> temporal
     worker -- "gRPC, outbound only<br/>serve the connection's queue" --> temporal
@@ -85,7 +85,7 @@ Campaigns will need all of this: waiting for merges, waves, pausing.
 
 | Component | Responsibility |
 |---|---|
-| `http` (`/v1`) | connections, reconciles, head refreshes and syncs (each with `?wait=` long-poll on Postgres), repositories (filtered, keyset-paged). Admin bearer token. Asking for a run records it, then starts its workflow; if Temporal will not take it, the run is recorded failed and the call answers 503. Serving a run still in flight, it asks Temporal about its workflow and records the run as failed if the workflow closed without recording it, is gone, or has a workflow task that keeps failing (ADR 0013). |
+| `http` (`/v1`) | connections, reconciles, head refreshes and syncs (each with `?wait=` long-poll on Postgres), repositories (filtered, keyset-paged). One bearer token, `REPOPLANE_TOKEN` by default. Asking for a run records it, then starts its workflow; if Temporal will not take it, the run is recorded failed and the call answers 503. Serving a run still in flight, it asks Temporal about its workflow and records the run as failed if the workflow closed without recording it, is gone, or has a workflow task that keeps failing (ADR 0013). |
 | `control` | the Postgres activities: one store call each, safe to repeat; a refusal from the store is non-retryable |
 | control worker | Temporal worker on `repoplane-control`, hosting the workflows and the control activities; it shares the process and the shutdown with the HTTP server |
 | `store` | run steps (`start_*`, `record_*`, `unseen`, `finish_*`, `fail_*`), the inventory upsert (identity by forge id, watermark, never delete), migrations |
@@ -226,7 +226,7 @@ run's id is also its Temporal workflow id.
 ## Secrets
 
 Secrets are named, never written:
-- The API's config names the variables that hold its database URL, its admin token and, for
+- The API's config names the variables that hold its database URL, its token and, for
   Temporal Cloud, the Temporal API key.
 - A connection stores the *name* of the variable that holds its forge token. Only a worker
   reads it, inside the activity, so it never enters workflow history.

@@ -15,24 +15,11 @@ pub struct Config {
     pub listen: String,
     #[serde(default = "default_database_url_env")]
     pub database_url_env: String,
-    #[serde(default)]
-    pub admin: Admin,
+    /// The variable holding the token every `/v1` request must carry: the one the CLI sends.
+    #[serde(default = "default_token_env")]
+    pub token_env: String,
     #[serde(default)]
     pub temporal: TemporalConfig,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Admin {
-    pub token_env: String,
-}
-
-impl Default for Admin {
-    fn default() -> Self {
-        Admin {
-            token_env: "REPOPLANE_ADMIN_TOKEN".into(),
-        }
-    }
 }
 
 fn default_listen() -> String {
@@ -43,12 +30,16 @@ fn default_database_url_env() -> String {
     "REPOPLANE_DATABASE_URL".into()
 }
 
+fn default_token_env() -> String {
+    "REPOPLANE_TOKEN".into()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             listen: default_listen(),
             database_url_env: default_database_url_env(),
-            admin: Admin::default(),
+            token_env: default_token_env(),
             temporal: TemporalConfig::default(),
         }
     }
@@ -71,7 +62,7 @@ impl Config {
     fn validate(&self) -> anyhow::Result<()> {
         for (field, v) in [
             ("database_url_env", &self.database_url_env),
-            ("admin.token_env", &self.admin.token_env),
+            ("token_env", &self.token_env),
         ] {
             if !secret::valid_env_name(v) {
                 bail!(secret::describe_env_name_error(field, v));
@@ -101,8 +92,7 @@ mod tests {
         assert_eq!(c.temporal.namespace, "default");
         assert!(serde_yaml_ng::from_str::<Config>("lisen: x").is_err());
         let bad: Config =
-            serde_yaml_ng::from_str("admin: {token_env: ghp_0123456789abcdefABCDEF0123456789abcd}")
-                .unwrap();
+            serde_yaml_ng::from_str("token_env: ghp_0123456789abcdefABCDEF0123456789abcd").unwrap();
         assert!(
             bad.validate()
                 .unwrap_err()

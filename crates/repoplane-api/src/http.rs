@@ -1,4 +1,4 @@
-//! The HTTP surface: `/v1` for clients, behind the admin token. Asking for a reconcile or a head
+//! The HTTP surface: `/v1` for clients, behind the API token. Asking for a reconcile or a head
 //! refresh records the run, then starts its Temporal workflow; reading a run reads Postgres, and
 //! asks Temporal about a run still in flight, so one whose workflow ended or stalled without
 //! recording it is recorded as failed. The API never calls a forge (ADR 0002).
@@ -45,7 +45,7 @@ const START_GRACE: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
-    pub admin_token: Arc<String>,
+    pub token: Arc<String>,
     pub temporal: Client,
 }
 
@@ -161,9 +161,9 @@ fn unauthorized() -> ApiError {
     )
 }
 
-fn admin(s: &AppState, h: &HeaderMap) -> ApiResult<()> {
+fn authorized(s: &AppState, h: &HeaderMap) -> ApiResult<()> {
     match bearer(h) {
-        Some(t) if same(t, &s.admin_token) => Ok(()),
+        Some(t) if same(t, &s.token) => Ok(()),
         _ => Err(unauthorized()),
     }
 }
@@ -180,7 +180,7 @@ async fn create_connection(
     h: HeaderMap,
     Json(body): Json<CreateConnection>,
 ) -> ApiResult<impl IntoResponse> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let c = s.store.create_connection(&body).await?;
     Ok((StatusCode::CREATED, Json(c)))
 }
@@ -189,7 +189,7 @@ async fn list_connections(
     State(s): State<AppState>,
     h: HeaderMap,
 ) -> ApiResult<Json<ConnectionList>> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     Ok(Json(ConnectionList {
         items: s.store.connections().await?,
     }))
@@ -200,7 +200,7 @@ async fn get_connection(
     h: HeaderMap,
     Path(key): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     Ok(Json(s.store.connection(&key).await?))
 }
 
@@ -209,7 +209,7 @@ async fn request_reconcile(
     h: HeaderMap,
     Path(key): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let c = s.store.connection(&key).await?;
     let (r, created) = s.store.request_reconcile(&c).await?;
     // The run in flight may be one whose workflow ended or stalled without saying so: settle it
@@ -398,7 +398,7 @@ async fn get_reconcile(
     Path(id): Path<String>,
     Query(q): Query<WaitQuery>,
 ) -> ApiResult<Json<Reconcile>> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let id: ReconcileId = id
         .parse()
         .map_err(|e: repoplane_proto::id::IdError| ApiError::bad(e.to_string()))?;
@@ -434,7 +434,7 @@ async fn request_head_refresh(
     Path(key): Path<String>,
     body: Option<Json<RefreshHeads>>,
 ) -> ApiResult<impl IntoResponse> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let c = s.store.connection(&key).await?;
     let filter = body.map(|Json(b)| b).unwrap_or_default();
     let r = s.store.request_head_refresh(&c, &filter).await?;
@@ -464,7 +464,7 @@ async fn get_head_refresh(
     Path(id): Path<String>,
     Query(q): Query<WaitQuery>,
 ) -> ApiResult<Json<HeadRefresh>> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let id: HeadRefreshId = id
         .parse()
         .map_err(|e: repoplane_proto::id::IdError| ApiError::bad(e.to_string()))?;
@@ -500,7 +500,7 @@ async fn request_sync(
     h: HeaderMap,
     Path(key): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let c = s.store.connection(&key).await?;
     let (mut r, mut created) = s.store.request_reconcile(&c).await?;
     if !created && settle(&s, Run::Reconcile(r.id), r.requested_at).await {
@@ -543,7 +543,7 @@ async fn get_sync(
     Path(id): Path<String>,
     Query(q): Query<WaitQuery>,
 ) -> ApiResult<Json<Sync>> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let id: SyncId = id
         .parse()
         .map_err(|e: repoplane_proto::id::IdError| ApiError::bad(e.to_string()))?;
@@ -587,7 +587,7 @@ async fn list_repositories(
     h: HeaderMap,
     Query(q): Query<RepoQuery>,
 ) -> ApiResult<Json<RepositoryList>> {
-    admin(&s, &h)?;
+    authorized(&s, &h)?;
     let connection = match &q.connection {
         Some(key) => {
             let c = s.store.connection(key).await?;
