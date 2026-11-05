@@ -16,11 +16,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # Leave no token in git config: every git call in the suite brings its own credentials.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/checkout@v7
         with:
           repository: repoplane/fleets
           path: fleets
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.93
         with:
           components: rustfmt, clippy
@@ -44,11 +48,15 @@ jobs:
       group: sandbox-${{ matrix.sandbox }}
       cancel-in-progress: false
     steps:
+      # Leave no token in git config: every git call in the suite brings its own credentials.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/checkout@v7
         with:
           repository: repoplane/fleets
           path: fleets
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.93
       - uses: Swatinem/rust-cache@v2
       - run: make e2e SANDBOX=${{ matrix.sandbox }}
