@@ -1083,8 +1083,8 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forgelab"
-version = "0.15.0"
-source = "git+https://github.com/repoplane/forgelab?tag=v0.15.0#56c49e40a5b092f86556cd1ab7221b68417fd5e7"
+version = "0.15.1"
+source = "git+https://github.com/repoplane/forgelab?tag=v0.15.1#19979ac0b130cd508aa0ef6cdb123fc5fe84d831"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
