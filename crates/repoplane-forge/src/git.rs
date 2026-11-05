@@ -6,7 +6,10 @@
 //!
 //! git runs in an environment built from scratch: the caller's `GIT_DIR` or global configuration
 //! must not redirect it, and only proxy and CA settings pass through, which a forge behind a
-//! corporate proxy needs. The token travels as an `Authorization` header scoped to the forge's
+//! corporate proxy needs. It runs from `/`, so the configuration of a repository the worker
+//! happens to start inside is not read either: `actions/checkout` leaves an `Authorization` header
+//! for github.com in its checkout's, and GitHub refuses a request that carries two (CI,
+//! 2026-11-05). The token travels as an `Authorization` header scoped to the forge's
 //! origin through `GIT_CONFIG_*`, never in the URL, where every user of the machine could read it
 //! in `ps`. Everything git prints is scrubbed of it.
 
@@ -67,12 +70,7 @@ pub async fn ls_remote(
     auth: Option<&GitAuth>,
 ) -> Result<Option<String>, ForgeError> {
     let refname = format!("refs/heads/{}", remote.branch);
-    let mut cmd = Command::new("git");
-    cmd.env_clear()
-        .envs(env(&remote.url, auth))
-        .args(["ls-remote", "--quiet", remote.url.as_str(), &refname])
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
+    let mut cmd = command(&remote.url, &refname, auth);
     let scrub = |s: &str| match auth {
         Some(a) => a.token.scrub(s),
         None => s.to_string(),
@@ -108,6 +106,19 @@ pub async fn ls_remote(
     }
     // The branch is not on the remote: an empty repository, or one renamed since listing.
     Ok(None)
+}
+
+/// The `ls-remote` process: the environment below, and `/` as its directory so that no
+/// repository around the worker lends git its configuration.
+fn command(url: &url::Url, refname: &str, auth: Option<&GitAuth>) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_clear()
+        .envs(env(url, auth))
+        .current_dir("/")
+        .args(["ls-remote", "--quiet", url.as_str(), refname])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    cmd
 }
 
 /// A failed `ls-remote`, read from what git said: a repository gone since the listing has no
@@ -439,6 +450,18 @@ mod tests {
             "the token travels base64-encoded in a header only"
         );
         assert!(!e.iter().any(|(k, _)| k == "GIT_DIR"));
+    }
+
+    /// Started inside a checkout, git would read that repository's configuration too: in CI it
+    /// added the workflow's own `Authorization` header to ours, and GitHub answered 400.
+    #[test]
+    fn git_runs_outside_any_repository() {
+        let url = url::Url::parse("https://github.com/o/r.git").unwrap();
+        let cmd = command(&url, "refs/heads/main", None);
+        assert_eq!(
+            cmd.as_std().get_current_dir(),
+            Some(std::path::Path::new("/"))
+        );
     }
 
     #[test]
