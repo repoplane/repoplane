@@ -1,12 +1,12 @@
 # repoplane
 
-**An accurate inventory of your repository fleet, across Forgejo, GitHub, GitLab and Azure DevOps.**
+**A control plane for repository fleets.**
 
-Repoplane connects to an organisation on a forge and keeps a record of every repository in it
-(name, default branch, topics, archived state), and reads the HEAD commit of the default
-branches you ask about. It
-is the ground the rest of repoplane stands on: rules evaluated at an exact revision, and fleet
-changes verified by re-evaluation rather than by counting merged pull requests.
+Repoplane connects to an organisation on Forgejo, GitHub, GitLab or Azure DevOps and keeps a
+record of every repository in it (name, default branch, topics, archived state), and reads the
+HEAD commit of the default branches you ask about. That inventory is the ground the rest of
+repoplane stands on: rules evaluated at an exact revision, and fleet changes verified by
+re-evaluation rather than by counting merged pull requests.
 
 ```console
 $ repoplane connection add forgejo --name lab --org acme-services \
