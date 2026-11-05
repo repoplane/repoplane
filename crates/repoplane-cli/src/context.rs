@@ -39,6 +39,9 @@ fn default_token_env() -> String {
     "REPOPLANE_TOKEN".into()
 }
 
+/// The API a CLI without a contexts file talks to: the API's default `listen`.
+const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
+
 #[derive(Debug, Clone)]
 pub struct Context {
     pub name: String,
@@ -114,7 +117,7 @@ pub fn resolve(requested: Option<&str>, api_url_override: Option<&str>) -> anyho
             Context {
                 name: "default".into(),
                 api_url: std::env::var("REPOPLANE_API_URL")
-                    .unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+                    .unwrap_or_else(|_| DEFAULT_API_URL.into()),
                 token_env: default_token_env(),
             }
         }
@@ -127,4 +130,22 @@ pub fn resolve(requested: Option<&str>, api_url_override: Option<&str>) -> anyho
         bail!(secret::describe_env_name_error("token_env", &ctx.token_env));
     }
     Ok(ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example operators copy describes the context a CLI without a file uses: it must
+    /// stay a file the CLI accepts, and stay that context.
+    #[test]
+    fn the_example_is_the_default_context() {
+        let f: File =
+            serde_yaml_ng::from_str(include_str!("../../../examples/contexts.yaml")).unwrap();
+        assert_eq!(f.version, 1);
+        let current = f.current.as_deref().unwrap();
+        let e = &f.contexts[current];
+        assert_eq!(e.api_url, DEFAULT_API_URL);
+        assert_eq!(e.token_env, default_token_env());
+    }
 }

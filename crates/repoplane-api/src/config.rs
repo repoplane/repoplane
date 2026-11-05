@@ -8,7 +8,7 @@ use repoplane_flow::TemporalConfig;
 use repoplane_proto::secret;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_listen")]
@@ -21,7 +21,7 @@ pub struct Config {
     pub temporal: TemporalConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Admin {
     pub token_env: String,
@@ -109,5 +109,27 @@ mod tests {
                 .to_string()
                 .contains("looks like a token")
         );
+    }
+
+    /// The example operators copy says "these are the defaults": it must stay true, and the key
+    /// it shows commented out must still be one the file accepts.
+    #[test]
+    fn the_example_is_the_defaults() {
+        let example = include_str!("../../../examples/repoplane-api.yaml");
+        let parsed: Config = serde_yaml_ng::from_str(example).unwrap();
+        assert_eq!(parsed, Config::default());
+        // A file without keys means what no file means.
+        assert_eq!(
+            serde_yaml_ng::from_str::<Config>("{}").unwrap(),
+            Config::default()
+        );
+
+        let cloud: Config =
+            serde_yaml_ng::from_str(&example.replace("# api_key_env:", "api_key_env:")).unwrap();
+        assert_eq!(
+            cloud.temporal.api_key_env.as_deref(),
+            Some("TEMPORAL_API_KEY")
+        );
+        cloud.validate().unwrap();
     }
 }

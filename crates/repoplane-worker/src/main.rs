@@ -32,7 +32,7 @@ struct Cli {
     temporal_address: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     /// The task queue this worker serves: the `queue` of the connections it runs for.
@@ -146,4 +146,29 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     let _ = ctrl_c.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example operators copy shows the defaults: it must stay true, and the key it shows
+    /// commented out must still be one the file accepts.
+    #[test]
+    fn the_example_is_the_defaults() {
+        let example = include_str!("../../../examples/repoplane-worker.yaml");
+        let defaults: Config = serde_yaml_ng::from_str("{}").unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<Config>(example).unwrap(),
+            defaults
+        );
+
+        let cloud: Config =
+            serde_yaml_ng::from_str(&example.replace("# api_key_env:", "api_key_env:")).unwrap();
+        assert_eq!(
+            cloud.temporal.api_key_env.as_deref(),
+            Some("TEMPORAL_API_KEY")
+        );
+        cloud.temporal.validate().unwrap();
+    }
 }

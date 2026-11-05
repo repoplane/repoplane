@@ -7,7 +7,7 @@ use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
 
 use repoplane_proto::secret;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemporalConfig {
     /// `http://localhost:7233` for a local server; `https://<ns>.<acct>.tmprl.cloud:7233` for

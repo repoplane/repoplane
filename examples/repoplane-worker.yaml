@@ -1,6 +1,7 @@
 # repoplane-worker configuration. The worker runs the forge activities of the connections on its
 # queue. It makes outbound calls only — to Temporal, and to those connections' forges — and reads
 # each connection's forge token from the variable the connection names, in its own environment.
+# Every key is optional; these are the defaults.
 queue: default
 concurrency: 64                            # forge activities at once: the bound on fan-out
 temporal:
