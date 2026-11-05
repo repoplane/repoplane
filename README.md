@@ -139,4 +139,5 @@ expects the fleets checkout at `../fleets` (or `REPOPLANE_FLEETS_DIR`).
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). Contributions are accepted under a
+[Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
