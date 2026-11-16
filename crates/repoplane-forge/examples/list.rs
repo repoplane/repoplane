@@ -4,11 +4,11 @@
 //!   cargo run -p repoplane-forge --example list -- <forge> <base_url> <org> <TOKEN_ENV>
 //!
 //! Prints one line per repository (full name, default branch, archived, HEAD, topics), then a
-//! summary line with the page and repository counts.
+//! summary line with the repository count and how long listing and reading HEADs took.
 
 use std::collections::HashSet;
 
-use repoplane_forge::{ReqwestTransport, Token, lister};
+use repoplane_forge::{ReqwestTransport, Token, list_all, lister};
 use repoplane_proto::id::ConnectionId;
 use repoplane_proto::inventory::ConnectionSpec;
 use tokio_util::sync::CancellationToken;
@@ -34,47 +34,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         CancellationToken::new(),
     )?;
     let started = std::time::Instant::now();
-    let (mut cursor, mut pages, mut total) = (None::<String>, 0, 0);
+    let repos = list_all(l.as_ref()).await?;
+    let listed_in = started.elapsed();
+    let heads = l.heads(&repos).await;
     let mut ids = HashSet::new();
-    loop {
-        let page = l.page(cursor.as_deref()).await?;
-        let heads = l
-            .heads(&page.repos)
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        pages += 1;
-        for (r, h) in page.repos.iter().zip(heads) {
-            let s = &r.snapshot;
-            if !ids.insert(s.external_id.clone()) {
-                eprintln!("duplicate external id {} ({})", s.external_id, s.full_name);
-            }
-            total += 1;
-            println!(
-                "{}\t{}\t{}\t{}\t{}",
-                s.full_name,
-                s.default_branch.as_deref().unwrap_or("—"),
-                s.archived,
-                h.as_deref().unwrap_or("—"),
-                s.topics
-                    .as_ref()
-                    .map(|t| {
-                        let mut t = t.clone();
-                        t.sort();
-                        t.join(" ")
-                    })
-                    .unwrap_or_else(|| "—".into()),
-            );
+    for (r, h) in repos.iter().zip(heads) {
+        let s = &r.snapshot;
+        if !ids.insert(s.external_id.clone()) {
+            eprintln!("duplicate external id {} ({})", s.external_id, s.full_name);
         }
-        match page.next {
-            Some(n) => cursor = Some(n),
-            None => break,
-        }
+        let head = match h {
+            Ok(h) => h.unwrap_or_else(|| "—".into()),
+            Err(e) => format!("unread: {e}"),
+        };
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            s.full_name,
+            s.default_branch.as_deref().unwrap_or("—"),
+            s.archived,
+            head,
+            s.topics
+                .as_ref()
+                .map(|t| {
+                    let mut t = t.clone();
+                    t.sort();
+                    t.join(" ")
+                })
+                .unwrap_or_else(|| "—".into()),
+        );
     }
     eprintln!(
-        "{total} repositories, {} distinct, {pages} pages, {:.1}s",
+        "{} repositories, {} distinct, listed in {:.1}s, HEADs read in {:.1}s",
+        repos.len(),
         ids.len(),
-        started.elapsed().as_secs_f64()
+        listed_in.as_secs_f64(),
+        (started.elapsed() - listed_in).as_secs_f64()
     );
     Ok(())
 }

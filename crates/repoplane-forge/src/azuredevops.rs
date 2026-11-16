@@ -1,8 +1,13 @@
-//! Azure DevOps: `GET {org}/_apis/git/repositories`, one call for every repository of every
-//! project in the organisation, disabled ones included. That endpoint takes no `$top` and
-//! answers no continuation token, so a listing is a single page. HEADs are read over git
-//! (`ls-remote`), outside the load Azure DevOps meters per user; a disabled repository refuses
-//! every read, so it is never asked.
+//! Azure DevOps: its repository endpoints take no `$top` and answer no continuation token, so
+//! the adapter pages the listing itself. The first page asks the whole organisation in one call
+//! (`GET {org}/_apis/git/repositories`, disabled repositories included), cuts each project's
+//! repositories, by id, into slices of [`PAGE`], answers the first slice, and every other one as
+//! a page to fetch at once. Such a page asks only its project
+//! (`GET {org}/{project}/_apis/git/repositories`) and answers its slice. As a single page the
+//! organisation was a single workflow payload: 888 KB for 2,144 repositories, past Temporal's
+//! 2 MB limit near 4,800; a slice stays near 400 KB however large a project grows. HEADs are
+//! read over git (`ls-remote`), outside the load Azure DevOps meters per user; a disabled
+//! repository refuses every read, so it is never asked.
 //!
 //! A bad token is not a 401 here: the forge redirects to a sign-in page, which a client that
 //! follows redirects receives as a 203 of HTML. `X-TFS-FedAuthRedirect: Suppress` asks for a
@@ -37,6 +42,8 @@ pub struct AzureDevops {
     base: String,
     org: String,
     git: GitAuth,
+    /// [`PAGE`]; smaller in tests.
+    page_size: usize,
 }
 
 impl AzureDevops {
@@ -70,7 +77,44 @@ impl AzureDevops {
                 username: "repoplane",
                 token,
             },
+            page_size: PAGE,
         })
+    }
+}
+
+/// Cuts an organisation's repositories into slices of `size` per project, in order of project
+/// then id: the first slice, and a `{project}:{offset}` cursor for every other.
+fn slices(repos: Vec<Repo>, size: usize) -> (Vec<Repo>, Vec<String>) {
+    let mut by_project: std::collections::BTreeMap<(String, String), Vec<Repo>> =
+        std::collections::BTreeMap::new();
+    for r in repos {
+        let key = (r.project.name.to_lowercase(), r.project.id.clone());
+        by_project.entry(key).or_default().push(r);
+    }
+    let (mut first, mut rest) = (None, Vec::new());
+    for ((_, project), mut repos) in by_project {
+        repos.sort_by(|a, b| a.id.cmp(&b.id));
+        let n = repos.len();
+        let mut from = 0;
+        if first.is_none() {
+            repos.truncate(size);
+            first = Some(repos);
+            from = size;
+        }
+        rest.extend((from..n).step_by(size).map(|o| format!("{project}:{o}")));
+    }
+    (first.unwrap_or_default(), rest)
+}
+
+/// The repository endpoints are documented as unpaged; were one ever to page, say so rather
+/// than report part of the organisation as the whole of it.
+fn no_continuation(answer: &crate::http::Answer, org: &str) -> Result<(), ForgeError> {
+    match answer.header("x-ms-continuationtoken") {
+        Some(_) => Err(ForgeError::protocol(
+            FORGE,
+            format!("{org}: a repository listing answered a continuation token"),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -129,33 +173,44 @@ struct Project {
     name: String,
 }
 
+/// Repositories per page: about 400 KB of workflow payload, under Temporal's 512 KB warning.
+pub const PAGE: usize = 1_000;
+
 #[async_trait]
 impl Lister for AzureDevops {
     fn kind(&self) -> ForgeKind {
         ForgeKind::Azuredevops
     }
 
+    /// With no cursor, the first slice of the first project, and every other slice of every
+    /// project as a cursor in `rest`, fetched at once; with a cursor (`{project}:{offset}`),
+    /// that slice. A slice is [`PAGE`] repositories of one project, in order of id.
     async fn page(&self, cursor: Option<&str>) -> Result<Page, ForgeError> {
-        // The listing is one page, so there is no cursor this adapter could have handed out.
-        if let Some(c) = cursor {
-            return Err(ForgeError::protocol(
-                FORGE,
-                format!("cursor {c:?}: an Azure DevOps listing has a single page"),
-            ));
-        }
-        let url = format!("{}/_apis/git/repositories?{API_VERSION}", self.api);
-        let (answer, repos): (_, Option<Repos>) = self.http.get_json(&url).await?;
-        // The endpoint is documented as unpaged; were it ever to page, say so rather than
-        // report a partial organisation as the whole of it.
-        if answer.header("x-ms-continuationtoken").is_some() {
-            return Err(ForgeError::protocol(
-                FORGE,
-                format!("{} answered a continuation token", self.org),
-            ));
-        }
-        let repos = repos.map(|r| r.value).unwrap_or_default();
+        let Some(cursor) = cursor else {
+            let (first, rest) = slices(self.all_repos().await?, self.page_size);
+            return Ok(Page {
+                repos: first.into_iter().map(|r| self.listed(r)).collect(),
+                next: None,
+                rest: Some(rest),
+            });
+        };
+        // Only this adapter hands out cursors: a project id, and an offset into its listing.
+        let (project, offset) = cursor
+            .split_once(':')
+            .filter(|(p, _)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'))
+            .and_then(|(p, o)| Some((p, o.parse::<usize>().ok()?)))
+            .ok_or_else(|| {
+                ForgeError::protocol(FORGE, format!("cursor {cursor:?} is not a slice"))
+            })?;
+        let mut repos = self.project_repos(project).await?;
+        repos.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(Page {
-            repos: repos.into_iter().map(|r| self.listed(r)).collect(),
+            repos: repos
+                .into_iter()
+                .skip(offset)
+                .take(self.page_size)
+                .map(|r| self.listed(r))
+                .collect(),
             next: None,
             rest: None,
         })
@@ -188,19 +243,47 @@ impl Lister for AzureDevops {
         match self.http.get_json::<Repo>(&url).await {
             Ok((_, Some(r))) => Ok(Some(self.listed(r))),
             Ok((_, None)) => Ok(None),
-            Err(e) if e.class() == Some(Class::NotFound) => {
-                let listing = self.page(None).await?;
-                Ok(listing
-                    .repos
-                    .into_iter()
-                    .find(|l| l.snapshot.external_id.eq_ignore_ascii_case(external_id)))
-            }
+            Err(e) if e.class() == Some(Class::NotFound) => Ok(self
+                .all_repos()
+                .await?
+                .into_iter()
+                .find(|r| r.id.eq_ignore_ascii_case(external_id))
+                .map(|r| self.listed(r))),
             Err(e) => Err(e),
         }
     }
 }
 
 impl AzureDevops {
+    /// A project's repositories, disabled ones included, in one call. A project deleted since
+    /// the first page has none; repositories deleted since shift its slices and one can be
+    /// skipped. Either way they are left unseen, and looked up by id before any is marked
+    /// inaccessible (ADR 0005).
+    async fn project_repos(&self, project: &str) -> Result<Vec<Repo>, ForgeError> {
+        let url = format!(
+            "{}/{project}/_apis/git/repositories?{API_VERSION}",
+            self.api
+        );
+        match self.http.get_json::<Repos>(&url).await {
+            Ok((answer, repos)) => {
+                no_continuation(&answer, &self.org)?;
+                Ok(repos.map(|r| r.value).unwrap_or_default())
+            }
+            Err(e) if e.class() == Some(Class::NotFound) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Every repository of the organisation in one call, to cut into slices or to find one
+    /// repository: never answered whole as a page, since a page goes into workflow history and
+    /// the whole organisation can outgrow a payload.
+    async fn all_repos(&self) -> Result<Vec<Repo>, ForgeError> {
+        let url = format!("{}/_apis/git/repositories?{API_VERSION}", self.api);
+        let (answer, repos): (_, Option<Repos>) = self.http.get_json(&url).await?;
+        no_continuation(&answer, &self.org)?;
+        Ok(repos.map(|r| r.value).unwrap_or_default())
+    }
+
     fn listed(&self, r: Repo) -> Listed {
         let default_branch = r
             .default_branch
@@ -258,13 +341,22 @@ mod tests {
     ) -> serde_json::Value {
         let mut r = serde_json::json!({
             "id": id, "name": name, "size": 0, "isDisabled": disabled,
-            "project": {"id": format!("p-{project}"), "name": project, "state": "wellFormed"},
+            "project": {"id": pid(project), "name": project, "state": "wellFormed"},
             "webUrl": format!("https://dev.azure.com/org/{project}/_git/{name}"),
         });
         if let Some(b) = branch {
             r["defaultBranch"] = serde_json::json!(b);
         }
         r
+    }
+
+    /// A project's id, hex like the GUIDs Azure DevOps gives.
+    fn pid(project: &str) -> &'static str {
+        match project {
+            "fleet" => "f1ee7",
+            "platform" => "b1a7",
+            _ => "2e7a",
+        }
     }
 
     fn ado(t: Arc<ScriptedTransport>) -> AzureDevops {
@@ -294,9 +386,19 @@ mod tests {
         }
     }
 
+    /// The organisation in one call, cut per project into slices by id: the first answered,
+    /// every other a cursor fetched at once, which asks only its project. A page never holds
+    /// more than a slice, however large a project grows.
     #[tokio::test]
-    async fn lists_every_project_in_one_page() {
-        let t = ScriptedTransport::new(|req| {
+    async fn lists_the_organisation_in_slices_per_project() {
+        let fleet = || {
+            serde_json::json!({"count": 3, "value": [
+                repo("a5", "fleet", "web", Some("refs/heads/main"), false),
+                repo("a1", "fleet", "billing-api", Some("refs/heads/main"), false),
+                repo("a3", "fleet", "no-commits", None, false),
+            ]})
+        };
+        let t = ScriptedTransport::new(move |req| {
             let auth = req
                 .headers()
                 .get("authorization")
@@ -304,37 +406,82 @@ mod tests {
                 .to_str()
                 .unwrap();
             assert_eq!(auth, format!("Basic {}", BASE64.encode(":pat")));
-            ScriptedTransport::reply(
-                200,
-                serde_json::json!({"count": 3, "value": [
-                    repo("r1", "fleet", "billing-api", Some("refs/heads/main"), false),
-                    repo("r2", "platform", "core-api", Some("refs/heads/release/v2"), true),
-                    repo("r3", "fleet", "no-commits", None, false),
-                ]})
-                .to_string(),
-            )
+            match req.uri().path() {
+                "/org/_apis/git/repositories" => {
+                    let mut all = fleet();
+                    let v = all["value"].as_array_mut().unwrap();
+                    v.push(repo(
+                        "a2",
+                        "platform",
+                        "core-api",
+                        Some("refs/heads/release/v2"),
+                        true,
+                    ));
+                    v.push(repo("a4", "zeta", "tools", Some("refs/heads/main"), false));
+                    ScriptedTransport::reply(200, all.to_string())
+                }
+                "/org/f1ee7/_apis/git/repositories" => {
+                    ScriptedTransport::reply(200, fleet().to_string())
+                }
+                other => panic!("unexpected request for {other}"),
+            }
         });
-        let a = ado(t.clone());
-        let p = a.page(None).await.unwrap();
-        assert!(p.next.is_none());
-        let s: Vec<_> = p.repos.iter().map(|r| &r.snapshot).collect();
+        let mut a = ado(t.clone());
+        a.page_size = 2;
+        let first = a.page(None).await.unwrap();
+        assert!(first.next.is_none());
+        assert_eq!(
+            first.rest,
+            Some(vec![
+                "f1ee7:2".to_string(),
+                "b1a7:0".to_string(),
+                "2e7a:0".to_string()
+            ])
+        );
+        let s: Vec<_> = first.repos.iter().map(|r| &r.snapshot).collect();
+        assert_eq!(s.len(), 2);
         assert_eq!(s[0].full_name, "org/fleet/billing-api");
-        assert_eq!(s[0].external_id, "r1");
+        assert_eq!(s[0].external_id, "a1");
         assert_eq!(s[0].default_branch.as_deref(), Some("main"));
         assert!(!s[0].empty, "size 0 does not make a repository empty");
-        assert_eq!(s[1].default_branch.as_deref(), Some("release/v2"));
-        assert!(s[1].archived);
-        assert!(s[2].empty && s[2].default_branch.is_none());
+        assert!(s[1].empty && s[1].default_branch.is_none());
         assert!(s.iter().all(|s| s.topics.is_none()));
-        assert_eq!(p.repos[0].snapshot.locator, "p-fleet/r1");
+        assert_eq!(s[0].locator, "f1ee7/a1");
+
+        let rest = a.page(Some("f1ee7:2")).await.unwrap();
+        assert!(rest.next.is_none() && rest.rest.is_none());
+        let names: Vec<_> = rest
+            .repos
+            .iter()
+            .map(|r| r.snapshot.name.as_str())
+            .collect();
+        assert_eq!(names, ["web"]);
         assert_eq!(
             t.seen(),
-            vec!["GET /org/_apis/git/repositories?api-version=7.1"]
+            vec![
+                "GET /org/_apis/git/repositories?api-version=7.1",
+                "GET /org/f1ee7/_apis/git/repositories?api-version=7.1",
+            ]
         );
     }
 
+    /// A project deleted since the first page has no repositories: they go unseen, and are
+    /// looked up by id before anything is marked. An organisation with none is one empty page.
     #[tokio::test]
-    async fn refuses_any_cursor_and_a_continuation() {
+    async fn a_project_gone_or_no_repository_at_all_is_an_empty_page() {
+        let t = ScriptedTransport::new(|req| match req.uri().path() {
+            "/org/_apis/git/repositories" => ScriptedTransport::reply(200, r#"{"value": []}"#),
+            _ => ScriptedTransport::reply(404, r#"{"message":"TF200016: project not found"}"#),
+        });
+        let a = ado(t);
+        let none = a.page(None).await.unwrap();
+        assert!(none.repos.is_empty() && none.next.is_none());
+        assert_eq!(none.rest, Some(vec![]));
+        assert!(a.page(Some("dead:0")).await.unwrap().repos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuses_a_cursor_it_did_not_hand_out_and_a_paged_repository_list() {
         let t = ScriptedTransport::new(|_| {
             ScriptedTransport::reply_with(
                 200,
@@ -343,10 +490,16 @@ mod tests {
             )
         });
         let a = ado(t.clone());
-        assert!(a.page(Some("anything")).await.is_err());
+        for bad in ["../_apis/x:0", "f1ee7", "f1ee7:-1", ":0"] {
+            assert!(a.page(Some(bad)).await.is_err(), "{bad}");
+        }
         assert!(t.seen().is_empty());
         assert!(matches!(
             a.page(None).await,
+            Err(ForgeError::Protocol { .. })
+        ));
+        assert!(matches!(
+            a.page(Some("b1a7:0")).await,
             Err(ForgeError::Protocol { .. })
         ));
     }

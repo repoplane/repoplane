@@ -164,7 +164,7 @@ from the system it tests.
 | **Forgejo** | `GET /orgs/{org}/repos`, 50 per page (the server clamps); only the page *number* is taken from `Link`, because Forgejo writes it from its own `ROOT_URL` | in the payload | `archived` | `{base}/{owner}/{repo}.git` |
 | **GitHub** | `GET /orgs/{org}/repos`, 100 per page, `Link` rel=next only | in the payload | `archived` | `https://github.com/{owner}/{repo}.git` (or the Enterprise host), user `x-access-token` |
 | **GitLab** | `GET /groups/{path}/projects?include_subgroups=true`, 100 per page; offset, because keyset is silently ignored on this endpoint | in the payload | `archived`; projects pending deletion excluded | `{base}/{group}/…/{project}.git`, user `oauth2` |
-| **Azure DevOps** | `GET {org}/_apis/git/repositories`: every project, disabled repositories included, in one answer | **none**: `topics` is `null`, and `--topic` on such a connection is refused | `isDisabled`, whose HEAD cannot be read (never asked) | `{base}/{org}/{project}/_git/{repo}` |
+| **Azure DevOps** | `GET {org}/_apis/git/repositories`: every project, disabled repositories included, in one answer, which the adapter cuts per project into slices of 1,000 by id; every other slice is a page, from `GET {org}/{project}/_apis/git/repositories` | **none**: `topics` is `null`, and `--topic` on such a connection is refused | `isDisabled`, whose HEAD cannot be read (never asked) | `{base}/{org}/{project}/_git/{repo}` |
 
 Reconcile and head refresh are separate operations
 ([ADR 0011](adr/0011-inventory-and-heads-are-separate.md)). A reconcile records what exists and
@@ -281,10 +281,9 @@ is refused over `http://` unless the address is loopback, such as a TLS-terminat
 
 ## Known gaps
 
-- Azure DevOps answers the whole organisation in one listing call, so its single `list_page`
-  result carries every repository: 888 KB for 2,144 of them. Temporal warns above 512 KB
-  (TMPRL1103) and refuses a payload above 2 MB, so from about 4,800 repositories a reconcile
-  would fail. The adapter needs to hand the listing back in pieces.
+- A head refresh reads its targets in one activity result before handing them to its slices:
+  about 316 bytes a repository, against Temporal's 2 MB limit on a payload, so a refresh of more
+  than about 6,600 repositories fails. Each slice would need to read its own targets instead.
 
 - A reconcile's history carries every page it recorded: about 1.8 MB for 2,139 repositories,
   against Temporal's 50 MB per workflow. Organisations past a few tens of thousands of

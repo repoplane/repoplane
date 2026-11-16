@@ -73,6 +73,33 @@ pub trait Lister: Send + Sync {
     async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError>;
 }
 
+/// Every repository a listing returns, its pages walked as a reconcile walks them: the pages a
+/// first page names (`rest`) when it names them, otherwise one `next` after another. For tools
+/// and tests, one page at a time; a reconcile fetches them at once, as activities.
+pub async fn list_all(lister: &dyn Lister) -> Result<Vec<Listed>, ForgeError> {
+    let first = lister.page(None).await?;
+    let mut repos = first.repos;
+    if let Some(rest) = first.rest {
+        for cursor in rest {
+            repos.extend(lister.page(Some(&cursor)).await?.repos);
+        }
+        return Ok(repos);
+    }
+    let (mut next, mut seen) = (first.next, std::collections::BTreeSet::new());
+    while let Some(cursor) = next {
+        if !seen.insert(cursor.clone()) {
+            return Err(ForgeError::protocol(
+                lister.kind().as_str(),
+                format!("the listing returned page {cursor:?} twice"),
+            ));
+        }
+        let page = lister.page(Some(&cursor)).await?;
+        repos.extend(page.repos);
+        next = page.next;
+    }
+    Ok(repos)
+}
+
 /// True when `full_name` sits inside the organisation or group `org` (case-insensitive, as the
 /// forges treat owner names).
 pub fn within(org: &str, full_name: &str) -> bool {
@@ -172,6 +199,78 @@ pub fn commit_id(forge: &'static str, s: &str) -> Result<String, ForgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listing scripted page by page, by cursor.
+    struct Pages(Vec<(Option<&'static str>, Page)>);
+
+    fn page(names: &[&str], next: Option<&str>, rest: Option<&[&str]>) -> Page {
+        Page {
+            repos: names
+                .iter()
+                .map(|n| Listed {
+                    snapshot: RepoSnapshot {
+                        external_id: n.to_string(),
+                        full_name: format!("o/{n}"),
+                        name: n.to_string(),
+                        default_branch: None,
+                        archived: false,
+                        topics: None,
+                        locator: String::new(),
+                        empty: true,
+                        web_url: None,
+                    },
+                })
+                .collect(),
+            next: next.map(str::to_string),
+            rest: rest.map(|r| r.iter().map(|c| c.to_string()).collect()),
+        }
+    }
+
+    #[async_trait]
+    impl Lister for Pages {
+        fn kind(&self) -> ForgeKind {
+            ForgeKind::Github
+        }
+        async fn page(&self, cursor: Option<&str>) -> Result<Page, ForgeError> {
+            Ok(self.0.iter().find(|(c, _)| *c == cursor).unwrap().1.clone())
+        }
+        async fn heads(&self, _: &[Listed]) -> Vec<Result<Option<String>, ForgeError>> {
+            Vec::new()
+        }
+        async fn get(&self, _: &str) -> Result<Option<Listed>, ForgeError> {
+            Ok(None)
+        }
+    }
+
+    fn names(repos: Vec<Listed>) -> Vec<String> {
+        repos.into_iter().map(|r| r.snapshot.name).collect()
+    }
+
+    /// The pages a first page names are the listing, `next` on them notwithstanding (GitHub
+    /// names them and still links the next); without them, `next` is followed.
+    #[tokio::test]
+    async fn a_listing_is_walked_as_a_reconcile_walks_it() {
+        let named = Pages(vec![
+            (None, page(&["a"], Some("2"), Some(&["2", "3"]))),
+            (Some("2"), page(&["b"], Some("3"), None)),
+            (Some("3"), page(&["c"], None, None)),
+        ]);
+        assert_eq!(names(list_all(&named).await.unwrap()), ["a", "b", "c"]);
+        let linked = Pages(vec![
+            (None, page(&["a"], Some("2"), None)),
+            (Some("2"), page(&["b"], Some("3"), None)),
+            (Some("3"), page(&["c"], None, None)),
+        ]);
+        assert_eq!(names(list_all(&linked).await.unwrap()), ["a", "b", "c"]);
+        let looping = Pages(vec![
+            (None, page(&["a"], Some("2"), None)),
+            (Some("2"), page(&["b"], Some("2"), None)),
+        ]);
+        assert!(matches!(
+            list_all(&looping).await,
+            Err(ForgeError::Protocol { .. })
+        ));
+    }
 
     #[test]
     fn escaping() {
