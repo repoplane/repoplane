@@ -304,7 +304,8 @@ impl Store {
     /// from a branch that is no longer the default (a reconcile recorded the change while the
     /// refresh ran) describes the old branch and is dropped. Each target counts once per
     /// refresh, repeats included: *observed* when first recorded, *changed* when that differs
-    /// from what was recorded before the refresh.
+    /// from what was recorded before the refresh, *unread* when the forge would not let the
+    /// token read it, which leaves its recorded HEAD as it was.
     pub async fn record_heads(
         &self,
         refresh: HeadRefreshId,
@@ -344,10 +345,26 @@ impl Store {
         .collect();
         let mut changed = 0i64;
         let mut observed = 0i64;
+        let mut unread = 0i64;
         for h in heads {
             let Some(t) = targets.get(&h.external_id) else {
                 continue; // not a target of this refresh, or gone inaccessible since
             };
+            if let Some(reason) = &h.unread {
+                let reason: String = reason.chars().take(1000).collect();
+                unread += sqlx::query(
+                    "insert into head_refresh_unread (organization_id, head_refresh_id, repository_id, reason)
+                     select organization_id, id, $2, $3 from head_refreshes where id = $1
+                     on conflict do nothing",
+                )
+                .bind(refresh_id)
+                .bind(t.id)
+                .bind(&reason)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected() as i64;
+                continue;
+            }
             if t.default_branch != h.branch {
                 continue; // read from a branch that is no longer the default
             }
@@ -367,18 +384,46 @@ impl Store {
             .await?;
         }
         sqlx::query(
-            "update head_refreshes set observed = observed + $2, changed = changed + $3 where id = $1",
+            "update head_refreshes set observed = observed + $2, changed = changed + $3,
+                    unread = unread + $4
+             where id = $1",
         )
         .bind(refresh_id)
         .bind(observed)
         .bind(changed)
+        .bind(unread)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(changed)
     }
 
+    /// Closes the refresh as succeeded, unless the forge refused the token some targets and
+    /// gave it the HEAD of none: a token every repository refuses (a missing scope) is the
+    /// token's problem, not a repository's, and fails the refresh, saying so. An empty
+    /// repository is answered without asking the forge, so it does not count as read.
     pub async fn finish_refresh(&self, refresh: HeadRefreshId) -> Result<()> {
+        let refused: Option<(i64, i64, i64, Option<String>)> = sqlx::query_as(
+            "select h.unread, h.targeted,
+                    (select count(*) from repositories r
+                     where r.id = any(h.targets) and r.head_sha is not null
+                       and r.head_observed_at >= h.started_at),
+                    (select r.full_name || ': ' || u.reason from head_refresh_unread u
+                     join repositories r on r.id = u.repository_id
+                     where u.head_refresh_id = h.id order by r.full_name limit 1)
+             from head_refreshes h
+             where h.id = $1 and h.status = 'running' and h.unread > 0",
+        )
+        .bind(refresh.uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((unread, targeted, 0, example)) = refused {
+            return Err(StoreError::Invalid(format!(
+                "the forge gave the token none of {targeted} HEADs: {unread} repositories refused \
+                 it, like {}",
+                example.unwrap_or_default()
+            )));
+        }
         sqlx::query(
             "update head_refreshes set status = 'succeeded', finished_at = now(), error = null
              where id = $1 and status = 'running'",

@@ -133,10 +133,13 @@ fn classify(forge: &'static str, path: String, stderr: &str) -> Result<Option<St
         path: path.clone(),
         body: stderr.to_string(),
     };
-    // The HTTP status, when git says it, decides: "The requested URL returned error: 503".
+    // The HTTP status, when git says it, decides: "The requested URL returned error: 503". A
+    // 401 refuses the token; a 403 refuses this token this repository, which the others may
+    // still be read with (a GitLab Guest of a private project).
     match http_status(stderr) {
         Some(404) => return Ok(None),
-        Some(s @ (401 | 403)) => return Err(status(Class::Auth, s)),
+        Some(401) => return Err(status(Class::Auth, 401)),
+        Some(403) => return Err(status(Class::Forbidden, 403)),
         Some(429) => return Err(status(Class::RateLimited, 429)),
         Some(_) => return Err(transient(forge, path, stderr)),
         None => {}
@@ -150,11 +153,16 @@ fn classify(forge: &'static str, path: String, stderr: &str) -> Result<Option<St
     {
         return Err(status(Class::RateLimited, 429));
     }
+    // A refused token, said in words. Sent as a header, a token git sees refused makes it ask
+    // for a username instead, which it may not: "could not read Username for '…': terminal
+    // prompts disabled" is how a 401 reads.
     let refusal = [
         "authentication failed",
         "access denied",
         "permission denied",
         "not authorized",
+        "could not read username",
+        "terminal prompts disabled",
     ];
     if refusal.iter().any(|p| words.contains(p)) {
         return Err(status(Class::Auth, 401));
@@ -401,10 +409,25 @@ mod tests {
                 .unwrap_err()
                 .retryable()
         );
-        assert_eq!(
+        // A 403 refuses this repository, a 401 the token; neither is retried.
+        let forbidden =
             read("fatal: unable to access 'https://x/o/r/': The requested URL returned error: 403")
+                .unwrap_err();
+        assert_eq!(forbidden.class(), Some(Class::Forbidden));
+        assert!(!forbidden.retryable());
+        assert_eq!(
+            read("fatal: unable to access 'https://x/o/r/': The requested URL returned error: 401")
                 .unwrap_err()
                 .class(),
+            Some(Class::Auth)
+        );
+        // How git says a 401 when the token travels as a header: it asks for a username.
+        assert_eq!(
+            read(
+                "fatal: could not read Username for 'https://gitlab.com': terminal prompts disabled"
+            )
+            .unwrap_err()
+            .class(),
             Some(Class::Auth)
         );
         assert_eq!(

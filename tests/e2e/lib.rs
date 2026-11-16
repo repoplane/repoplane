@@ -900,6 +900,8 @@ struct Faults {
     refuse: std::sync::Arc<std::sync::atomic::AtomicBool>,
     hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
     held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Repositories git is refused for (403), by name; `*` for all.
+    refuse_git: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Drop for ForgeProxy {
@@ -972,6 +974,12 @@ impl ForgeProxy {
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// From now on, git is refused (403) for the repository named `repo`, or for every one
+    /// with `*`, as a forge refuses a token a repository it may not read; `None` lifts it.
+    pub fn refuse_git(&self, repo: Option<&str>) {
+        *self.faults.refuse_git.lock().unwrap() = repo.map(str::to_string);
+    }
+
     /// How many listing requests were held so far.
     pub fn held(&self) -> usize {
         self.faults.held.load(std::sync::atomic::Ordering::SeqCst)
@@ -1009,6 +1017,21 @@ async fn forward(
         .unwrap_or("1")
         .to_string();
     use std::sync::atomic::Ordering::SeqCst;
+    let git = uri.path().contains(".git/");
+    let refused = s
+        .faults
+        .refuse_git
+        .lock()
+        .unwrap()
+        .clone()
+        .is_some_and(|r| git && (r == "*" || uri.path().contains(&format!("/{r}.git/"))));
+    if refused {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "You are not allowed to download code from this project.",
+        )
+            .into_response();
+    }
     if listing && s.faults.hold.load(SeqCst) {
         s.faults.held.fetch_add(1, SeqCst);
         while s.faults.hold.load(SeqCst) {

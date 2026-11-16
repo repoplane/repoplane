@@ -188,16 +188,33 @@ pub fn head_refresh(connection: &str, r: &HeadRefresh) -> String {
     if let Some(e) = &r.error {
         out.push_str(&format!("{:<12}{e}\n", "Error"));
     }
-    let n = [r.targeted, r.observed, r.changed];
+    let mut n = vec![
+        ("Targeted", r.targeted),
+        ("Observed", r.observed),
+        ("Changed", r.changed),
+    ];
+    if r.unread > 0 {
+        n.push(("Unread", r.unread));
+    }
     let w = n
         .iter()
-        .map(|v| v.to_string().len())
+        .map(|(_, v)| v.to_string().len())
         .max()
         .unwrap_or(1)
         .max(3);
     out.push('\n');
-    for (k, v) in [("Targeted", n[0]), ("Observed", n[1]), ("Changed", n[2])] {
+    for (k, v) in n {
         out.push_str(&format!("{k:<13}{v:>w$}\n"));
+    }
+    if !r.unread_repositories.is_empty() {
+        out.push('\n');
+        for u in &r.unread_repositories {
+            out.push_str(&format!("unread  {}  {}\n", u.full_name, u.reason));
+        }
+        let more = r.unread - r.unread_repositories.len() as i64;
+        if more > 0 {
+            out.push_str(&format!("unread  … and {more} more\n"));
+        }
     }
     out
 }
@@ -383,6 +400,8 @@ mod tests {
                 targeted: 6,
                 observed: 6,
                 changed: 6,
+                unread: 0,
+                unread_repositories: Vec::new(),
                 error: None,
                 requested_at: now,
                 started_at: None,
@@ -397,5 +416,39 @@ mod tests {
                 .unwrap();
         let out = sync(&r);
         assert!(readme.contains(&out), "README does not show:\n{out}");
+    }
+
+    /// Unread repositories are counted and named, with the forge's reason, and a refresh with
+    /// none says nothing of them.
+    #[test]
+    fn a_refresh_names_what_it_could_not_read() {
+        let now = chrono::Utc::now();
+        let mut r = HeadRefresh {
+            id: "hrf_06G9N0A2QPZ3M4X5Y6T7V8W9RS".parse().unwrap(),
+            connection_id: "con_06G9N0A2QPZ3M4X5Y6T7V8W9RS".parse().unwrap(),
+            status: RunStatus::Succeeded,
+            targeted: 3,
+            observed: 2,
+            changed: 0,
+            unread: 0,
+            unread_repositories: Vec::new(),
+            error: None,
+            requested_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+        assert!(!head_refresh("lab", &r).contains("Unread"));
+        r.unread = 2;
+        r.unread_repositories = vec![repoplane_proto::api::UnreadRepository {
+            full_name: "acme/secret".into(),
+            reason: "git ls-remote: 403".into(),
+        }];
+        let out = head_refresh("lab", &r);
+        assert!(out.contains("Unread"), "{out}");
+        assert!(
+            out.contains("unread  acme/secret  git ls-remote: 403"),
+            "{out}"
+        );
+        assert!(out.contains("… and 1 more"), "{out}");
     }
 }
