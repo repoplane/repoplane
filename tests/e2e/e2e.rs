@@ -931,18 +931,11 @@ async fn settled(s: &Suite) -> anyhow::Result<()> {
     let mut polls = 0;
     loop {
         polls += 1;
-        let mut listed = std::collections::BTreeMap::new();
-        let mut cursor: Option<String> = None;
-        loop {
-            let page = lister.page(cursor.as_deref()).await?;
-            for r in page.repos {
-                listed.insert(r.snapshot.full_name.clone(), r.snapshot);
-            }
-            match page.next {
-                Some(n) => cursor = Some(n),
-                None => break,
-            }
-        }
+        let listed: std::collections::BTreeMap<_, _> = repoplane_forge::list_all(lister.as_ref())
+            .await?
+            .into_iter()
+            .map(|r| (r.snapshot.full_name.clone(), r.snapshot))
+            .collect();
         let differing: Vec<&String> = want
             .iter()
             .filter(|(name, e)| {
@@ -988,19 +981,11 @@ async fn until_listed(
     let lister = s.side.lister()?;
     let begun = std::time::Instant::now();
     loop {
-        let mut cursor: Option<String> = None;
-        let mut seen = None;
-        loop {
-            let page = lister.page(cursor.as_deref()).await?;
-            if let Some(r) = page.repos.iter().find(|r| r.snapshot.full_name == name) {
-                seen = Some(r.snapshot.clone());
-                break;
-            }
-            match page.next {
-                Some(n) => cursor = Some(n),
-                None => break,
-            }
-        }
+        let seen = repoplane_forge::list_all(lister.as_ref())
+            .await?
+            .into_iter()
+            .find(|r| r.snapshot.full_name == name)
+            .map(|r| r.snapshot);
         if seen.as_ref().is_some_and(&want) {
             return Ok(begun.elapsed());
         }
