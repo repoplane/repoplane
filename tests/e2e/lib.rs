@@ -898,6 +898,8 @@ struct Faults {
     rate_limit: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     rate_limited: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     refuse: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hold: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    held: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for ForgeProxy {
@@ -962,6 +964,19 @@ impl ForgeProxy {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// While on, every listing request is held unanswered: a forge call in flight, for as long
+    /// as the scenario needs one.
+    pub fn hold_listings(&self, on: bool) {
+        self.faults
+            .hold
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many listing requests were held so far.
+    pub fn held(&self) -> usize {
+        self.faults.held.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// While on, every listing request is answered 401.
     pub fn refuse_token(&self, on: bool) {
         self.faults
@@ -994,6 +1009,12 @@ async fn forward(
         .unwrap_or("1")
         .to_string();
     use std::sync::atomic::Ordering::SeqCst;
+    if listing && s.faults.hold.load(SeqCst) {
+        s.faults.held.fetch_add(1, SeqCst);
+        while s.faults.hold.load(SeqCst) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
     if listing && s.faults.refuse.load(SeqCst) {
         return (
             axum::http::StatusCode::UNAUTHORIZED,

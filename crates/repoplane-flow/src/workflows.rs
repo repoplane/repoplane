@@ -20,8 +20,8 @@ use temporalio_workflow::{RetryPolicy, WorkflowTermination, join_all};
 use repoplane_proto::inventory::ConnectionSpec;
 
 use crate::activities::{
-    Control, Forge, ListPage, Lookup, RATE_LIMITED_ATTEMPTS, ReadHead, ReconcileFailed,
-    RecordHeads, RecordPage, RefreshFailed, SyncFailed,
+    Control, FORGE_HEARTBEAT_TIMEOUT, Forge, ListPage, Lookup, RATE_LIMITED_ATTEMPTS, ReadHead,
+    ReconcileFailed, RecordHeads, RecordPage, RefreshFailed, SyncFailed,
 };
 use crate::{
     CONTROL_QUEUE, CheckInput, CheckOutcome, LookupsInput, ReadHeadsInput, ReconcileInput,
@@ -49,6 +49,7 @@ const SLICE: usize = 1_000;
 fn forge(c: &ConnectionSpec) -> ActivityOptions {
     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(15 * 60))
         .task_queue(c.queue.clone())
+        .heartbeat_timeout(FORGE_HEARTBEAT_TIMEOUT)
         .retry_policy(
             RetryPolicy::builder()
                 .initial_interval(Duration::from_secs(1))

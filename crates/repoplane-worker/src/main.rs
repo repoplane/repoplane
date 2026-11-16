@@ -144,21 +144,34 @@ async fn main() -> anyhow::Result<()> {
                 tokens: Arc::new(tokens),
             })
             .tuner(tuner)
+            // On a stop, what has not finished by then is cancelled, and Temporal runs it again
+            // on another worker: a call sleeping out a rate limit does not hold the stop for long.
+            .graceful_shutdown_period(SHUTDOWN_GRACE)
             .build(),
     )
     .map_err(|e| anyhow::anyhow!("temporal worker: {e}"))?;
     let stop = worker.shutdown_handle();
     tracing::info!(queue = %cfg.queue, temporal = %cfg.temporal.address, concurrency = cfg.concurrency, tokens = ?token_keys, "worker started");
-    let (_, ran) = tokio::join!(
-        async {
-            shutdown().await;
-            tracing::info!("shutting down: finishing the activities in flight");
+    // A worker that stops by itself (a namespace that fails validation, a rotated key) ends the
+    // process with an error, so it is restarted, rather than staying up and polling nothing.
+    let run = worker.run();
+    tokio::pin!(run);
+    tokio::select! {
+        ran = &mut run => {
+            ran.map_err(|e| anyhow::anyhow!("temporal worker: {e}"))?;
+            bail!("the Temporal worker stopped by itself; exiting so the worker restarts");
+        }
+        _ = shutdown() => {
+            tracing::info!(grace_secs = SHUTDOWN_GRACE.as_secs(), "shutting down: finishing the activities in flight");
             stop();
-        },
-        worker.run()
-    );
-    ran.map_err(|e| anyhow::anyhow!("temporal worker: {e}"))
+        }
+    }
+    run.await
+        .map_err(|e| anyhow::anyhow!("temporal worker: {e}"))
 }
+
+/// How long a stop waits for the activities in flight before cancelling them.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 async fn shutdown() {
     let ctrl_c = tokio::signal::ctrl_c();

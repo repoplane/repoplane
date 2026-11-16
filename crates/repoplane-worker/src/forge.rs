@@ -3,7 +3,9 @@
 //! carries no credential, not even the name of one — and does one thing: list a page, look
 //! repositories up by id, or read HEADs.
 
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use repoplane_flow::activities::{
     FORGE_ATTEMPTS, ListPage, ListedPage, Lookup, MAX_RATE_LIMIT_WAIT, ReadHead,
@@ -46,13 +48,47 @@ pub fn failure(e: ForgeError, attempt: u32) -> ActivityError {
     ActivityError::application(failure)
 }
 
+/// How often a forge call tells Temporal this worker is still on it. The workflow's heartbeat
+/// timeout is a few of these, so a worker that died is noticed within that timeout, not after
+/// the call's whole start-to-close timeout.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(5);
+
+/// Runs a forge call while heartbeating, and stops it when Temporal cancels the activity: its
+/// workflow ended, or this worker is stopping. It then answers cancelled, which Temporal turns
+/// into a retry on another worker when this one was stopping.
+async fn alive<T>(
+    ctx: &ActivityContext,
+    cancel: &CancellationToken,
+    work: impl Future<Output = Result<T, ActivityError>>,
+) -> Result<T, ActivityError> {
+    tokio::pin!(work);
+    let mut beat = tokio::time::interval(HEARTBEAT_EVERY);
+    loop {
+        tokio::select! {
+            done = &mut work => return done,
+            _ = ctx.cancelled() => {
+                cancel.cancel();
+                return Err(ActivityError::cancelled());
+            }
+            _ = beat.tick() => {
+                let _ = ctx.record_heartbeat(()).await;
+            }
+        }
+    }
+}
+
 impl ForgeActivities {
-    fn lister(&self, c: &ConnectionSpec, attempt: u32) -> Result<Box<dyn Lister>, ActivityError> {
+    fn lister(
+        &self,
+        c: &ConnectionSpec,
+        attempt: u32,
+        cancel: CancellationToken,
+    ) -> Result<Box<dyn Lister>, ActivityError> {
         let token = self
             .tokens
             .for_connection(c)
             .map_err(|e| failure(e, attempt))?;
-        repoplane_forge::lister(c, token, self.transport.clone(), CancellationToken::new())
+        repoplane_forge::lister(c, token, self.transport.clone(), cancel)
             .map_err(|e| failure(e, attempt))
     }
 }
@@ -65,11 +101,14 @@ impl ForgeActivities {
         ctx: ActivityContext,
         input: ListPage,
     ) -> Result<ListedPage, ActivityError> {
-        let attempt = ctx.info().attempt;
-        let lister = self.lister(&input.connection, attempt)?;
-        list_page(lister.as_ref(), input.cursor.as_deref())
-            .await
-            .map_err(|e| failure(e, attempt))
+        let (attempt, cancel) = (ctx.info().attempt, CancellationToken::new());
+        let lister = self.lister(&input.connection, attempt, cancel.clone())?;
+        alive(&ctx, &cancel, async {
+            list_page(lister.as_ref(), input.cursor.as_deref())
+                .await
+                .map_err(|e| failure(e, attempt))
+        })
+        .await
     }
 
     #[activity(definition = repoplane_flow::activities::forge_defs::Lookup)]
@@ -78,11 +117,14 @@ impl ForgeActivities {
         ctx: ActivityContext,
         input: Lookup,
     ) -> Result<Option<RepoSnapshot>, ActivityError> {
-        let attempt = ctx.info().attempt;
-        let lister = self.lister(&input.connection, attempt)?;
-        let found = lookup(lister.as_ref(), &input.id)
-            .await
-            .map_err(|e| failure(e, attempt))?;
+        let (attempt, cancel) = (ctx.info().attempt, CancellationToken::new());
+        let lister = self.lister(&input.connection, attempt, cancel.clone())?;
+        let found = alive(&ctx, &cancel, async {
+            lookup(lister.as_ref(), &input.id)
+                .await
+                .map_err(|e| failure(e, attempt))
+        })
+        .await?;
         tracing::info!(
             connection = %input.connection.id,
             id = %input.id,
@@ -98,11 +140,14 @@ impl ForgeActivities {
         ctx: ActivityContext,
         input: ReadHead,
     ) -> Result<ObservedHead, ActivityError> {
-        let attempt = ctx.info().attempt;
-        let lister = self.lister(&input.connection, attempt)?;
-        read_head(lister.as_ref(), input.target.repo)
-            .await
-            .map_err(|e| failure(e, attempt))
+        let (attempt, cancel) = (ctx.info().attempt, CancellationToken::new());
+        let lister = self.lister(&input.connection, attempt, cancel.clone())?;
+        alive(&ctx, &cancel, async {
+            read_head(lister.as_ref(), input.target.repo)
+                .await
+                .map_err(|e| failure(e, attempt))
+        })
+        .await
     }
 }
 

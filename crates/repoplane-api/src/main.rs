@@ -10,6 +10,7 @@ mod http;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -102,16 +103,35 @@ async fn main() -> anyhow::Result<()> {
 
             // One stop for both: a signal ends the HTTP server, which tells the worker to finish
             // its activities and stop. The worker's future is not Send, so the two share this task.
+            // A worker that stops by itself (a namespace that fails validation, a rotated key)
+            // stops the HTTP server too, and the process exits with an error: serving on with no
+            // worker would leave every run queued, with nothing saying why.
+            let worker_down = Arc::new(tokio::sync::Notify::new());
+            let signalled = Arc::new(AtomicBool::new(false));
             let serve = async {
+                let (down, signalled) = (worker_down.clone(), signalled.clone());
                 let r = axum::serve(listener, http::router(state))
-                    .with_graceful_shutdown(shutdown())
+                    .with_graceful_shutdown(async move {
+                        tokio::select! {
+                            _ = shutdown() => signalled.store(true, Ordering::SeqCst),
+                            _ = down.notified() => {}
+                        }
+                    })
                     .await;
                 stop_worker();
                 r
             };
-            let (served, worked) = tokio::join!(serve, worker.run());
+            let work = async {
+                let r = worker.run().await;
+                worker_down.notify_one();
+                r
+            };
+            let (served, worked) = tokio::join!(serve, work);
             served?;
             worked.map_err(|e| anyhow::anyhow!("temporal worker: {e}"))?;
+            if !signalled.load(Ordering::SeqCst) {
+                anyhow::bail!("the Temporal worker stopped by itself; exiting so the API restarts");
+            }
             Ok(())
         }
     }

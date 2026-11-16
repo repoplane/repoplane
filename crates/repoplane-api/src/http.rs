@@ -30,6 +30,7 @@ use temporalio_client::{
     Client, UntypedWorkflow, WorkflowDescribeOptions, WorkflowExecutionStatus,
     WorkflowIdConflictPolicy, WorkflowStartOptions, WorkflowTerminateOptions,
 };
+use temporalio_common::protos::temporal::api::workflowservice::v1::DescribeWorkflowExecutionResponse;
 
 const MAX_RECONCILE_WAIT: Duration = Duration::from_secs(60);
 /// How long adding a connection waits on its check: the check's own budget, and some.
@@ -360,8 +361,9 @@ impl Run {
 
 /// Checks a run still in flight against its workflow, and records it as failed when the
 /// workflow will never record it: it was closed without completing (terminated, timed out,
-/// failed, canceled), it no longer exists, or its workflow task keeps failing. Returns whether
-/// the run was recorded as failed. A Temporal that cannot be reached changes nothing.
+/// failed, canceled), it no longer exists, or its workflow task, or that of a child it waits on,
+/// keeps failing. Returns whether the run was recorded as failed. A Temporal that cannot be
+/// reached changes nothing.
 async fn settle(s: &AppState, run: Run, requested_at: chrono::DateTime<chrono::Utc>) -> bool {
     let handle = s
         .temporal
@@ -369,18 +371,11 @@ async fn settle(s: &AppState, run: Run, requested_at: chrono::DateTime<chrono::U
     let why = match handle.describe(WorkflowDescribeOptions::default()).await {
         Ok(d) => match d.status() {
             WorkflowExecutionStatus::Running => {
-                let attempt = d
-                    .raw_description
-                    .pending_workflow_task
-                    .as_ref()
-                    .map_or(0, |t| t.attempt);
-                if attempt < STALLED_ATTEMPTS {
+                let Some(stall) = stalled(s, &d.raw_description).await else {
                     return false;
-                }
-                let problem = problems(&d).unwrap_or_else(|| "see the workflow in Temporal".into());
-                let why = format!(
-                    "the workflow stalled: its task failed {attempt} times in a row ({problem})"
-                );
+                };
+                let why = stall.describe();
+                // Ending the run's workflow ends the children it waits on, the stalled one too.
                 let stop = WorkflowTerminateOptions::builder()
                     .reason(why.clone())
                     .build();
@@ -423,8 +418,82 @@ async fn settle(s: &AppState, run: Run, requested_at: chrono::DateTime<chrono::U
 
 /// What Temporal reports wrong with a workflow, from its `TemporalReportedProblems` attribute:
 /// `category=WorkflowTaskFailed, cause=WorkflowTaskFailedCausePendingActivitiesLimitExceeded`.
-fn problems(d: &temporalio_client::WorkflowExecutionDescription) -> Option<String> {
-    let info = d.raw_description.workflow_execution_info.as_ref()?;
+/// Most workflows looked at under one run, so a check stays a handful of calls: a run has a
+/// child per step and per slice of 1,000 repositories.
+const MAX_DESCRIBED: usize = 32;
+
+/// A workflow whose task keeps failing: Temporal retries it forever, so it will not finish.
+#[derive(Debug, PartialEq)]
+struct Stall {
+    /// `None` for the run's own workflow; otherwise the child's id.
+    child: Option<String>,
+    attempt: i32,
+    problem: String,
+}
+
+impl Stall {
+    fn describe(&self) -> String {
+        let (attempt, problem) = (self.attempt, &self.problem);
+        match &self.child {
+            None => format!(
+                "the workflow stalled: its task failed {attempt} times in a row ({problem})"
+            ),
+            Some(child) => format!(
+                "a step stalled: the task of workflow {child} failed {attempt} times in a row \
+                 ({problem})"
+            ),
+        }
+    }
+}
+
+/// The described workflow, if its task has failed [`STALLED_ATTEMPTS`] times in a row.
+fn stall_of(d: &DescribeWorkflowExecutionResponse, child: Option<&str>) -> Option<Stall> {
+    let attempt = d.pending_workflow_task.as_ref().map_or(0, |t| t.attempt);
+    (attempt >= STALLED_ATTEMPTS).then(|| Stall {
+        child: child.map(str::to_string),
+        attempt,
+        problem: problems(d).unwrap_or_else(|| "see the workflow in Temporal".into()),
+    })
+}
+
+/// The children the described workflow is waiting on.
+fn children(d: &DescribeWorkflowExecutionResponse) -> impl Iterator<Item = String> + '_ {
+    d.pending_children.iter().map(|c| c.workflow_id.clone())
+}
+
+/// The first stalled workflow of a run in flight: its own, or one of the children it waits on,
+/// to any depth. A child's task failing does not fail its parent's, so without looking down the
+/// run would wait on it for ever, with nothing saying why.
+async fn stalled(s: &AppState, root: &DescribeWorkflowExecutionResponse) -> Option<Stall> {
+    if let Some(stall) = stall_of(root, None) {
+        return Some(stall);
+    }
+    let mut waiting: std::collections::VecDeque<String> = children(root).collect();
+    let mut described = 0;
+    while let Some(id) = waiting.pop_front() {
+        described += 1;
+        if described > MAX_DESCRIBED {
+            break;
+        }
+        let handle = s
+            .temporal
+            .get_workflow_handle::<UntypedWorkflow>(id.clone());
+        let Ok(d) = handle.describe(WorkflowDescribeOptions::default()).await else {
+            continue; // gone or unreachable: the next check looks again
+        };
+        if d.status() != WorkflowExecutionStatus::Running {
+            continue;
+        }
+        if let Some(stall) = stall_of(&d.raw_description, Some(&id)) {
+            return Some(stall);
+        }
+        waiting.extend(children(&d.raw_description));
+    }
+    None
+}
+
+fn problems(d: &DescribeWorkflowExecutionResponse) -> Option<String> {
+    let info = d.workflow_execution_info.as_ref()?;
     let attrs = info.search_attributes.as_ref()?;
     let raw = attrs.indexed_fields.get("TemporalReportedProblems")?;
     let list: Vec<String> = serde_json::from_slice(&raw.data).ok()?;
@@ -710,5 +779,50 @@ mod tests {
         assert_eq!(parse_wait("2m").ok().unwrap(), Duration::from_secs(120));
         assert_eq!(parse_wait("5").ok().unwrap(), Duration::from_secs(5));
         assert!(parse_wait("soon").is_err());
+    }
+
+    /// A described workflow: its task's attempt, and the children it waits on.
+    fn described(attempt: i32, children: &[&str]) -> DescribeWorkflowExecutionResponse {
+        use temporalio_common::protos::temporal::api::workflow::v1::{
+            PendingChildExecutionInfo, PendingWorkflowTaskInfo,
+        };
+        DescribeWorkflowExecutionResponse {
+            pending_workflow_task: (attempt > 0).then(|| PendingWorkflowTaskInfo {
+                attempt,
+                ..Default::default()
+            }),
+            pending_children: children
+                .iter()
+                .map(|id| PendingChildExecutionInfo {
+                    workflow_id: id.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A task that keeps failing is a stall, the run's own or a child's, and says which; one
+    /// that failed a few times may still pass.
+    #[test]
+    fn a_task_failing_again_and_again_is_a_stall() {
+        assert_eq!(stall_of(&described(STALLED_ATTEMPTS - 1, &[]), None), None);
+        let own = stall_of(&described(STALLED_ATTEMPTS, &[]), None).unwrap();
+        assert_eq!(own.child, None);
+        assert!(
+            own.describe().starts_with("the workflow stalled"),
+            "{}",
+            own.describe()
+        );
+        let child = stall_of(&described(7, &[]), Some("hrf_1-heads-2")).unwrap();
+        assert!(
+            child
+                .describe()
+                .contains("workflow hrf_1-heads-2 failed 7 times"),
+            "{}",
+            child.describe()
+        );
+        let sync = described(0, &["rec_1", "hrf_1"]);
+        assert_eq!(children(&sync).collect::<Vec<_>>(), ["rec_1", "hrf_1"]);
     }
 }

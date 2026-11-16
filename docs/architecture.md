@@ -85,7 +85,7 @@ Campaigns will need all of this: waiting for merges, waves, pausing.
 
 | Component | Responsibility |
 |---|---|
-| `http` (`/v1`) | connections, added only once a worker on their queue has listed the organisation (a `check-connection` workflow; `--no-check` skips it), reconciles, head refreshes and syncs (each with `?wait=` long-poll on Postgres), repositories (filtered, keyset-paged). One bearer token, `REPOPLANE_TOKEN` by default. Asking for a run records it, then starts its workflow; if Temporal will not take it, the run is recorded failed and the call answers 503. Serving a run still in flight, it asks Temporal about its workflow and records the run as failed if the workflow closed without recording it, is gone, or has a workflow task that keeps failing (ADR 0013). |
+| `http` (`/v1`) | connections, added only once a worker on their queue has listed the organisation (a `check-connection` workflow; `--no-check` skips it), reconciles, head refreshes and syncs (each with `?wait=` long-poll on Postgres), repositories (filtered, keyset-paged). One bearer token, `REPOPLANE_TOKEN` by default. Asking for a run records it, then starts its workflow; if Temporal will not take it, the run is recorded failed and the call answers 503. Serving a run still in flight, it asks Temporal about its workflow and records the run as failed if the workflow closed without recording it, is gone, or has a workflow task that keeps failing, its own or that of a child it waits on (ADR 0013). |
 | `control` | the Postgres activities: one store call each, safe to repeat; a refusal from the store is non-retryable |
 | control worker | Temporal worker on `repoplane-control`, hosting the workflows and the control activities; it shares the process and the shutdown with the HTTP server |
 | `store` | run steps (`start_*`, `record_*`, `unseen`, `finish_*`, `fail_*`), the inventory upsert (identity by forge id, watermark, never delete), migrations |
@@ -115,6 +115,14 @@ spends the quota again. The rule is the same on every forge; only a forge that r
 waits. A failure the worker marks non-retryable (a refused token, a forge the worker holds no
 token for, a protocol violation) fails the run at once. The run's record then says why, from
 the forge's own message.
+
+Forge steps heartbeat every few seconds, rate-limit waits included. A step whose worker dies is
+given up 30 s after its last heartbeat and run again on another worker, rather than after its
+15-minute timeout; a step whose run ended is cancelled, and stops its forge call. A worker that
+is stopped finishes what it can for 30 s, then cancels the rest, which Temporal runs elsewhere.
+If the Temporal worker inside `repoplane-api` or `repoplane-worker` stops by itself (a namespace
+that fails validation, a key that no longer works), the process exits with an error, so it is
+restarted rather than left up with nothing polling.
 
 Every activity's input and output lives in workflow history, so none carries a secret: a
 connection travels as its *variable name*. A replay test replays recorded histories against the
@@ -266,8 +274,8 @@ is refused over `http://` unless the address is loopback, such as a TLS-terminat
   - On local, three scenarios use a fault proxy in front of Forgejo: a listing that shifts under
     a deletion, a rate limit longer than one call's budget (waited out as long as the forge
     asked, never retried early), and a refused token (fails fast).
-  - A fourth local scenario kills the worker in the middle of a run; the run waits, and
-    completes when a worker returns.
+  - A fourth local scenario kills the worker in the middle of a forge call; the run waits,
+    and completes once a worker returns, the call being given up on its heartbeat.
   - A fifth adds a connection to a host the worker holds no token for: the run fails at once,
     naming the host.
 
