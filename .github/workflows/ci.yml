@@ -6,15 +6,20 @@ on:
   pull_request:
   schedule:
     - cron: "23 4 * * *" # nightly: the three cloud sandboxes
+  workflow_dispatch: # the three cloud sandboxes, on demand (Actions tab, or `gh workflow run CI`)
 
 permissions:
   contents: read
 
 jobs:
-  # Lint, unit tests, and the e2e suite on a Forgejo of its own: no secrets needed.
+  # Lint, unit tests, and the e2e suite on a Forgejo of its own: no secrets needed. This is what
+  # a pull request and a push to main run; a newer push to a pull request replaces its older run.
   local:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: local-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     steps:
       # Leave no token in git config: every git call in the suite brings its own credentials.
       - uses: actions/checkout@v7
@@ -33,11 +38,13 @@ jobs:
         env:
           REPOPLANE_FLEETS_DIR: ${{ github.workspace }}/fleets
 
-  # The same suite on the real sandboxes. It mutates them and puts them back with forgelab, so
-  # a sandbox is shared state: one run at a time per sandbox, across every branch.
+  # The same suite on the real sandboxes: nightly, or on demand. They take 15 to 30 minutes
+  # (gitlab.com Free's rate limit alone is most of gl's), so no pull request or push waits for
+  # them. It mutates them and puts them back with forgelab, so a sandbox is shared state: one
+  # run at a time per sandbox, across every branch.
   sandbox:
     needs: local
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
