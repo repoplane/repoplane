@@ -31,10 +31,41 @@ impl ReqwestTransport {
     pub fn new() -> Result<Arc<Self>, ForgeError> {
         let client = reqwest::Client::builder()
             .user_agent(concat!("repoplane-worker/", env!("CARGO_PKG_VERSION")))
+            .redirect(same_origin_only())
             .build()
             .map_err(|e| ForgeError::Config(format!("build HTTP client: {e}")))?;
         Ok(Arc::new(ReqwestTransport { client }))
     }
+}
+
+/// Most redirects followed for one request, as reqwest's default allows.
+const MAX_REDIRECTS: usize = 10;
+
+/// Follows a redirect only within the origin the request was sent to. Every request carries the
+/// token, and a forge that points elsewhere (a sign-in gateway, a moved host, http to https) is
+/// answered with the redirect itself, which the client reports, rather than followed with the
+/// credentials. reqwest drops its own `Authorization` on such a hop, but not a header it does
+/// not know to be one.
+fn same_origin_only() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let within = attempt.previous().len() <= MAX_REDIRECTS
+            && attempt
+                .previous()
+                .first()
+                .is_some_and(|first| same_origin(first, attempt.url()));
+        if within {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// Same scheme, host and port: where a request's credentials may go.
+fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 #[async_trait]
@@ -377,7 +408,19 @@ impl HttpClient {
                 }
                 _ => {}
             }
-            let text = String::from_utf8_lossy(resp.body());
+            // A redirect still here is one to another origin, never followed: say where it led.
+            let location = (300..400)
+                .contains(&status)
+                .then(|| resp.headers().get(http::header::LOCATION))
+                .flatten()
+                .and_then(|l| l.to_str().ok());
+            let text = match location {
+                Some(to) => format!(
+                    "redirected to {to}, another origin than the forge's: not followed, so the \
+                     token is not sent there (check the connection's base URL)"
+                ),
+                None => String::from_utf8_lossy(resp.body()).into_owned(),
+            };
             let text = self.token.scrub(text.trim());
             let text = if text.len() > 1024 {
                 format!("{}…", &text[..text.floor_char_boundary(1024)])
@@ -467,6 +510,123 @@ mod tests {
         let (_, v): (_, Option<Vec<i32>>) = c.get_json("http://x/a").await.unwrap();
         assert_eq!(v, Some(vec![1]));
         assert_eq!(n.load(Ordering::SeqCst), 3);
+    }
+
+    /// A plain HTTP server on 127.0.0.1, answering each request with what `answer` gives for
+    /// its path, and keeping every request it received (lowercased).
+    struct Server {
+        base: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn server(answer: impl Fn(&str) -> String + Send + 'static) -> Server {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 16 * 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                log.lock().unwrap().push(request);
+                let _ = stream.write_all(answer(&path).as_bytes());
+            }
+        });
+        Server { base, seen }
+    }
+
+    fn redirect(to: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nlocation: {to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+    }
+
+    const OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+
+    /// Every request carries the token, so a forge is followed within its own origin only. A
+    /// redirect elsewhere is reported, saying where it led, and the other origin never sees the
+    /// token, whatever header carries it: reqwest drops `Authorization` on such a hop, but would
+    /// have sent GitLab's `PRIVATE-TOKEN` along.
+    #[tokio::test]
+    async fn the_token_never_follows_a_redirect_to_another_origin() {
+        let elsewhere = server(|_| OK.to_string());
+        let landing = format!("{}/landing", elsewhere.base);
+        let to = landing.clone();
+        let forge = server(move |path| match path {
+            "/moved" => redirect("/here"),
+            "/here" => OK.to_string(),
+            _ => redirect(&to),
+        });
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("authorization", "Bearer s3cr3t"),
+            ("private-token", "s3cr3t"),
+        ] {
+            let (k, v) = header(name, value).unwrap();
+            headers.insert(k, v);
+        }
+        let http = HttpClient::new(
+            "test",
+            ReqwestTransport::new().unwrap(),
+            classify_generic,
+            headers,
+            Token::new("s3cr3t").unwrap(),
+            CancellationToken::new(),
+        );
+
+        // Within the origin: followed, as before.
+        let a = http.get(&format!("{}/moved", forge.base)).await.unwrap();
+        assert_eq!(a.status, 200);
+
+        // To another origin (another port is another origin): not followed.
+        let Err(err) = http.get(&format!("{}/sso", forge.base)).await else {
+            panic!("a redirect to another origin was followed");
+        };
+        assert!(
+            matches!(err, ForgeError::Status { status: 302, .. }),
+            "{err}"
+        );
+        assert!(
+            !err.retryable(),
+            "a redirect elsewhere will not go away: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&landing) && message.contains("not followed"),
+            "{message}"
+        );
+        assert!(!message.contains("s3cr3t"), "{message}");
+        assert!(
+            elsewhere.seen.lock().unwrap().is_empty(),
+            "the other origin was asked: {:?}",
+            elsewhere.seen.lock().unwrap()
+        );
+        assert_eq!(forge.seen.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_origin_is_scheme_host_and_port() {
+        let u = |s: &str| reqwest::Url::parse(s).unwrap();
+        assert!(same_origin(
+            &u("https://gitlab.com/a"),
+            &u("https://gitlab.com:443/b?c")
+        ));
+        assert!(!same_origin(
+            &u("https://gitlab.com/a"),
+            &u("http://gitlab.com/a")
+        ));
+        assert!(!same_origin(
+            &u("https://gitlab.com/a"),
+            &u("https://sso.gitlab.com/a")
+        ));
+        assert!(!same_origin(
+            &u("https://gitlab.corp/a"),
+            &u("https://gitlab.corp:8443/a")
+        ));
     }
 
     #[tokio::test]
