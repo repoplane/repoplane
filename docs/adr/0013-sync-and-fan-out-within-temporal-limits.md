@@ -32,8 +32,9 @@ stayed `running` with nothing recording why.
   run as failed, with the reason, when:
   - the workflow was closed without completing (terminated, timed out, failed, canceled);
   - the workflow is gone;
-  - its workflow task has failed 5 times in a row. The API terminates such a workflow first,
-    because Temporal would retry it forever.
+  - its workflow task, or that of a child it waits on (to any depth), has failed 5 times in a
+    row. The API terminates the run's workflow first, which ends its children, because
+    Temporal would retry such a task forever.
 
   A failed sync fails its step in flight too, since Temporal ends a child when its parent closes.
 

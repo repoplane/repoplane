@@ -25,6 +25,11 @@ pub const FORGE_ATTEMPTS: u32 = 8;
 /// Free's 100 git requests a minute, that reads the HEADs of 1,500 repositories or more.
 pub const RATE_LIMITED_ATTEMPTS: u32 = 30;
 
+/// How long a forge call may go without a heartbeat before Temporal gives it up and tries again,
+/// on any worker: a worker killed mid-call costs this, not the call's 15-minute start-to-close
+/// timeout. The worker heartbeats every few seconds, rate-limit waits included.
+pub const FORGE_HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The longest a forge may ask a call to wait before its next attempt.
 pub const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 

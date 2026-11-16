@@ -600,43 +600,72 @@ async fn terminated(s: &Suite) -> anyhow::Result<()> {
     outcome
 }
 
+/// A worker killed in the middle of a forge call: the run waits, and once a worker is back,
+/// Temporal gives the call up when its heartbeats stop (30 s) and runs it again there. Without
+/// heartbeats it waited out the call's 15-minute start-to-close timeout.
 async fn worker_killed(s: &Suite) -> anyhow::Result<()> {
     if s.side.sandbox != "local" {
         eprintln!("skipped: only on the local sandbox");
         return Ok(());
     }
-    s.stack.kill_worker().await?;
-    let started: repoplane_proto::api::Reconcile = s
-        .stack
-        .cli_json(&["connection", "reconcile", &s.connection])
+    let proxy = ForgeProxy::start(&s.side).await?;
+    let conn = "e2e-local-killed";
+    s.stack
+        .cli(&[
+            "connection",
+            "add",
+            "forgejo",
+            "--name",
+            conn,
+            "--org",
+            &s.side.org,
+            "--base-url",
+            &proxy.base_url,
+        ])
         .await?;
+    proxy.hold_listings(true);
+    let started: repoplane_proto::api::Reconcile =
+        s.stack.cli_json(&["connection", "reconcile", conn]).await?;
     let id = started.id.to_string();
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    let waiting: repoplane_proto::api::Reconcile =
-        s.stack.cli_json(&["reconcile", "show", &id]).await?;
-    anyhow::ensure!(
-        !waiting.status.is_terminal(),
-        "with no worker the run ended anyway: {:?}",
-        waiting.status
-    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while proxy.held() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    s.stack.kill_worker().await?;
+    let killed = std::time::Instant::now();
+    let dead = async {
+        anyhow::ensure!(proxy.held() > 0, "no forge call was in flight to kill");
+        let waiting: repoplane_proto::api::Reconcile =
+            s.stack.cli_json(&["reconcile", "show", &id]).await?;
+        anyhow::ensure!(
+            !waiting.status.is_terminal(),
+            "with its worker dead the run ended anyway: {:?}",
+            waiting.status
+        );
+        Ok(())
+    }
+    .await;
+    // Whatever happened above, the forge answers again and a worker comes back.
+    proxy.hold_listings(false);
     s.stack.start_worker().await?;
+    dead?;
     let done: repoplane_proto::api::Reconcile = s
         .stack
         .cli_json(&["reconcile", "show", &id, "--wait", "--timeout", "5m"])
         .await?;
+    let took = killed.elapsed();
     anyhow::ensure!(
-        done.status.as_str() == "succeeded" && done.recorded == 0 && done.inaccessible == 0,
-        "after the worker came back: {:?}, recorded {}, inaccessible {}, error {:?}",
+        done.status.as_str() == "succeeded" && done.discovered == 123,
+        "after the worker came back: {:?}, discovered {}, error {:?}",
         done.status,
-        done.recorded,
-        done.inaccessible,
+        done.discovered,
         done.error
     );
-    let (diffs, _) = compare(
-        &expected(&s.side)?,
-        &s.stack.repos(&s.connection, false).await?,
+    anyhow::ensure!(
+        took < std::time::Duration::from_secs(180),
+        "the run took {took:?} after its worker died: the call was not given up on its heartbeat"
     );
-    anyhow::ensure!(diffs.is_empty(), "{}", diffs.join("\n"));
+    eprintln!("the run finished {took:?} after its worker was killed mid-call");
     Ok(())
 }
 
