@@ -20,8 +20,8 @@ use temporalio_workflow::{RetryPolicy, WorkflowTermination, join_all};
 use repoplane_proto::inventory::ConnectionSpec;
 
 use crate::activities::{
-    Control, Forge, ListPage, Lookup, ReadHead, ReconcileFailed, RecordHeads, RecordPage,
-    RefreshFailed, SyncFailed,
+    Control, Forge, ListPage, Lookup, RATE_LIMITED_ATTEMPTS, ReadHead, ReconcileFailed,
+    RecordHeads, RecordPage, RefreshFailed, SyncFailed,
 };
 use crate::{
     CONTROL_QUEUE, CheckInput, CheckOutcome, LookupsInput, ReadHeadsInput, ReconcileInput,
@@ -42,6 +42,10 @@ const SLICE: usize = 1_000;
 /// A forge call. Its HTTP layer already waits out rate limits for up to ten minutes per
 /// request, so an attempt may take that long; between attempts Temporal backs off. A failure the
 /// worker marks non-retryable (a bad token, a protocol violation) is not retried at all.
+///
+/// The same on every forge: an ordinary failure gets [`FORGE_ATTEMPTS`](crate::activities::FORGE_ATTEMPTS), after which the worker
+/// marks it non-retryable; only a forge that says it is rate limiting gets up to
+/// [`RATE_LIMITED_ATTEMPTS`], each after the wait it asked for.
 fn forge(c: &ConnectionSpec) -> ActivityOptions {
     ActivityOptions::with_start_to_close_timeout(Duration::from_secs(15 * 60))
         .task_queue(c.queue.clone())
@@ -50,7 +54,7 @@ fn forge(c: &ConnectionSpec) -> ActivityOptions {
                 .initial_interval(Duration::from_secs(1))
                 .backoff_coefficient(2.0)
                 .maximum_interval(Duration::from_secs(60))
-                .maximum_attempts(8)
+                .maximum_attempts(RATE_LIMITED_ATTEMPTS)
                 .build(),
         )
         .build()

@@ -16,6 +16,18 @@ use repoplane_proto::inventory::{
 
 // --- forge activities: on the connection's queue, in repoplane-worker --------------------------
 
+/// Attempts a forge call gets when it fails the ordinary way: a forge busy or unreachable,
+/// backing off from 1s to 60s, so about two minutes. The worker ends the retries there itself.
+pub const FORGE_ATTEMPTS: u32 = 8;
+
+/// Attempts a forge call gets while the forge says it is rate limiting, each after the wait it
+/// asked for (a minute when it does not say): about half an hour of quota windows. At gitlab.com
+/// Free's 100 git requests a minute, that reads the HEADs of 1,500 repositories or more.
+pub const RATE_LIMITED_ATTEMPTS: u32 = 30;
+
+/// The longest a forge may ask a call to wait before its next attempt.
+pub const MAX_RATE_LIMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListPage {
     pub connection: ConnectionSpec,

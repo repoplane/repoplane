@@ -91,7 +91,7 @@ async fn inventory() {
             Box::pin(worker_killed(&s)),
         ),
         (
-            "temporal retries a rate-limited forge call",
+            "a rate-limited forge call waits as long as the forge asked",
             true,
             Box::pin(rate_limited(&s)),
         ),
@@ -640,8 +640,9 @@ async fn worker_killed(s: &Suite) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A forge that asks for an hour's pause: longer than one call may wait, so the activity fails,
-/// retryably, and Temporal runs it again a moment later. Local only: the 429 comes from a proxy.
+/// A forge that asks for a wait longer than one call's budget is left alone that long: the run
+/// neither fails nor asks again early, since retrying inside the forge's window only spends its
+/// quota again. The wait asked for here is an hour, so the run is ended once that is checked.
 async fn rate_limited(s: &Suite) -> anyhow::Result<()> {
     if s.side.sandbox != "local" {
         eprintln!("skipped: only on the local sandbox");
@@ -664,21 +665,31 @@ async fn rate_limited(s: &Suite) -> anyhow::Result<()> {
             &proxy.base_url,
         ])
         .await?;
-    proxy.rate_limit_next(2);
-    let r = s.stack.reconcile(conn).await?;
-    anyhow::ensure!(
-        r.status.as_str() == "succeeded" && r.discovered == 123,
-        "reconcile {:?}, discovered {}, error {:?}",
-        r.status,
-        r.discovered,
-        r.error
-    );
-    anyhow::ensure!(
-        proxy.rate_limited() == 2,
-        "the proxy rate-limited {} call(s), want 2",
-        proxy.rate_limited()
-    );
-    Ok(())
+    proxy.rate_limit_next(1);
+    let started: repoplane_proto::api::Reconcile =
+        s.stack.cli_json(&["connection", "reconcile", conn]).await?;
+    let id = started.id.to_string();
+    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+    let waiting: repoplane_proto::api::Reconcile =
+        s.stack.cli_json(&["reconcile", "show", &id]).await?;
+    let outcome = (|| {
+        anyhow::ensure!(
+            !waiting.status.is_terminal(),
+            "a rate-limited run ended instead of waiting: {:?} {:?}",
+            waiting.status,
+            waiting.error
+        );
+        anyhow::ensure!(
+            proxy.rate_limited() == 1,
+            "the forge was asked {} times within its window, want once",
+            proxy.rate_limited()
+        );
+        Ok(())
+    })();
+    s.stack
+        .terminate(&id, "e2e: the forge asked for an hour")
+        .await?;
+    outcome
 }
 
 /// A token the forge refuses will not get better with retries: the run fails at once, saying

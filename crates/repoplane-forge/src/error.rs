@@ -3,6 +3,10 @@
 
 use std::time::Duration;
 
+/// How long to wait after a forge says it is rate limiting without saying for how long: the
+/// minute its limits are counted over, the shortest window any of them uses.
+pub const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
+
 /// What an HTTP answer means for the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -88,6 +92,20 @@ impl ForgeError {
             ForgeError::Decode { .. } | ForgeError::Protocol { .. } | ForgeError::Config(_) => {
                 false
             }
+        }
+    }
+
+    /// How long the forge asked to be left alone, when it said it was rate limiting. The next
+    /// attempt waits that long: retrying within seconds lands in the same window, which only
+    /// spends the quota again.
+    pub fn rate_limit_wait(&self) -> Option<Duration> {
+        match self {
+            ForgeError::RateLimitExceeded { wait, .. } => Some(*wait),
+            ForgeError::Status {
+                class: Class::RateLimited,
+                ..
+            } => Some(DEFAULT_RATE_LIMIT_WAIT),
+            _ => None,
         }
     }
 

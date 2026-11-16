@@ -122,11 +122,12 @@ fn command(url: &url::Url, refname: &str, auth: Option<&GitAuth>) -> Command {
 }
 
 /// A failed `ls-remote`, read from what git said: a repository gone since the listing has no
-/// HEAD; a refused credential will not get better; anything else may.
+/// HEAD; a refused credential will not get better; a rate limit waits out its window; anything
+/// else may pass.
 fn classify(forge: &'static str, path: String, stderr: &str) -> Result<Option<String>, ForgeError> {
-    let refused = |status: u16| ForgeError::Status {
+    let status = |class: Class, status: u16| ForgeError::Status {
         forge,
-        class: Class::Auth,
+        class,
         status,
         method: "git ls-remote".into(),
         path: path.clone(),
@@ -135,13 +136,20 @@ fn classify(forge: &'static str, path: String, stderr: &str) -> Result<Option<St
     // The HTTP status, when git says it, decides: "The requested URL returned error: 503".
     match http_status(stderr) {
         Some(404) => return Ok(None),
-        Some(s @ (401 | 403)) => return Err(refused(s)),
+        Some(s @ (401 | 403)) => return Err(status(Class::Auth, s)),
+        Some(429) => return Err(status(Class::RateLimited, 429)),
         Some(_) => return Err(transient(forge, path, stderr)),
         None => {}
     }
     // Otherwise the words, read without the URLs in them: a repository named
     // `identity-permissions-api` answered 503, and "permission" in its URL read as a refusal.
     let words = without_urls(&stderr.to_ascii_lowercase());
+    if ["rate limit", "too many requests"]
+        .iter()
+        .any(|p| words.contains(p))
+    {
+        return Err(status(Class::RateLimited, 429));
+    }
     let refusal = [
         "authentication failed",
         "access denied",
@@ -149,7 +157,7 @@ fn classify(forge: &'static str, path: String, stderr: &str) -> Result<Option<St
         "not authorized",
     ];
     if refusal.iter().any(|p| words.contains(p)) {
-        return Err(refused(401));
+        return Err(status(Class::Auth, 401));
     }
     let gone = [
         "not found",
@@ -416,6 +424,33 @@ mod tests {
                 .unwrap_err()
                 .retryable()
         );
+    }
+
+    /// gitlab.com's Free plan caps git at 100 requests a minute; the nightly gl run of
+    /// 2026-11-16 read it in these words. A rate limit is retried after the window, not within
+    /// seconds, whether git gives the status or only the words.
+    #[test]
+    fn a_rate_limit_waits_out_its_window() {
+        let read = |stderr: &str| classify("t", "/o/r.git".into(), stderr);
+        for stderr in [
+            "remote: Rate limit exceeded; see https://docs.gitlab.com/user/gitlab_com/rate_limits/ for more details\nfatal: unable to access 'https://gitlab.com/repoplane-sandbox/acme/checkout/events.git/': The requested URL returned error: 429",
+            "remote: Rate limit exceeded\nfatal: the remote end hung up unexpectedly",
+            "error: RPC failed; HTTP 429 Too Many Requests",
+        ] {
+            let err = read(stderr).unwrap_err();
+            assert_eq!(err.class(), Some(Class::RateLimited), "{stderr}");
+            assert!(err.retryable());
+            assert_eq!(
+                err.rate_limit_wait(),
+                Some(crate::error::DEFAULT_RATE_LIMIT_WAIT)
+            );
+        }
+        // A repository named for rate limits is not one.
+        let err = read(
+            "fatal: unable to access 'https://x/o/rate-limit-service/': Could not resolve host: x",
+        )
+        .unwrap_err();
+        assert_eq!(err.rate_limit_wait(), None);
     }
 
     #[test]
