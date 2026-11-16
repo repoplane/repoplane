@@ -9,11 +9,10 @@ valuable thing to steal in the system, and a bank will ask where its tokens live
 
 ## Decision
 
-Day 0 authenticates with tokens only, the same way fleets and forgelab do. A connection stores
-the *name* of an environment variable (`token_env`), which the schema checks against
-`^[A-Z_][A-Z0-9_]*$`. Only the worker resolves it, in its own environment. When GitHub Apps
-arrive, this ADR is reopened: who holds the App key, and whether the API may hold an
-inbound-only webhook secret.
+Day 0 authenticates with tokens only, the same way fleets and forgelab do. The API, its
+database and the CLI hold no forge credential, not even the name of one: the workers hold the
+tokens, and choose one for each connection (ADR 0014). When GitHub Apps arrive, this ADR is
+reopened: who holds the App key, and whether the API may hold an inbound-only webhook secret.
 
 ## Consequences
 
@@ -21,6 +20,6 @@ The token never crosses the API, a log or an error: the worker's HTTP layer scru
 base64 forms) from every message it reports.
 
 **No secret enters workflow history either** (ADR 0012). Workflow inputs and activity results are
-stored by Temporal. A connection travels in them as its token's *variable name*, and the forge
-activity reads the token itself, in the worker. Decoding the recorded histories in
-`crates/repoplane-flow/tests/histories` shows only variable names.
+stored by Temporal. A connection travels in them without any credential, and the forge activity
+takes the token the worker holds for it. Decoding the recorded histories in
+`crates/repoplane-flow/tests/histories` shows no token.

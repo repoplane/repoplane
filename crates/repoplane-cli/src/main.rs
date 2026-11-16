@@ -9,10 +9,9 @@ use std::io::Write as _;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::bail;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use repoplane_proto::ForgeKind;
 use repoplane_proto::api::{AuthMode, CreateConnection, RefreshHeads, RunStatus};
-use repoplane_proto::{ForgeKind, secret};
 
 use crate::client::{Client, RepoQuery};
 
@@ -95,11 +94,10 @@ struct AddArgs {
     /// DevOps organisation (all projects).
     #[arg(long)]
     org: String,
+    /// The workers on the connection's queue hold the token, chosen by the forge's host and the
+    /// organisation: a connection carries none.
     #[arg(long, value_enum, default_value = "token")]
     auth: Auth,
-    /// The NAME of the environment variable holding the token, in the worker's environment.
-    #[arg(long)]
-    token_env: String,
     /// The forge's URL. Required for Forgejo; defaults to the public service otherwise.
     #[arg(long)]
     base_url: Option<String>,
@@ -194,12 +192,6 @@ fn print(out: Output, table: String, json: &impl serde::Serialize) -> anyhow::Re
 }
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    // Validate what can be validated before reading any configuration.
-    if let Command::Connection(ConnectionCmd::Add(a)) = &cli.command
-        && !secret::valid_env_name(&a.token_env)
-    {
-        bail!(secret::describe_env_name_error("--token-env", &a.token_env));
-    }
     let ctx = context::resolve(cli.context.as_deref(), cli.api_url.as_deref())?;
     let api = Client::new(&ctx)?;
     let out = cli.output;
@@ -214,7 +206,6 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     auth: match a.auth {
                         Auth::Token => AuthMode::Token,
                     },
-                    token_env: a.token_env,
                     queue: a.queue,
                 })
                 .await?;
@@ -438,8 +429,6 @@ mod tests {
             "acme-services",
             "--auth",
             "token",
-            "--token-env",
-            "FORGEJO_TOKEN",
             "--base-url",
             "http://localhost:3000",
         ])

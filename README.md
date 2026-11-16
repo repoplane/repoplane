@@ -10,7 +10,7 @@ re-evaluation rather than by counting merged pull requests.
 
 ```console
 $ repoplane connection add forgejo --name lab --org acme-services \
-    --auth token --token-env FORGEJO_TOKEN --base-url http://localhost:3000
+    --auth token --base-url http://localhost:3000
 
 $ repoplane connection sync lab --wait
 Sync        syn_06G9N0B1C2D3E4F5G6H7J8K9MN
@@ -98,10 +98,10 @@ export REPOPLANE_TOKEN=dev-token   # the API accepts it, the CLI sends it
 
 target/debug/repoplane-api migrate
 target/debug/repoplane-api serve &
-FORGEJO_TOKEN=… target/debug/repoplane-worker &
+FORGEJO_TOKEN=… target/debug/repoplane-worker --token localhost=FORGEJO_TOKEN &
 
 target/debug/repoplane connection add forgejo --name lab --org <your-org> \
-  --auth token --token-env FORGEJO_TOKEN --base-url http://localhost:3000
+  --auth token --base-url http://localhost:3000
 target/debug/repoplane connection reconcile lab --wait
 target/debug/repoplane repo refresh-heads --connection lab --wait
 target/debug/repoplane repo list
@@ -113,10 +113,11 @@ id (`rec_…`, `hrf_…`).
 ## Secrets are named, never written
 
 Every credential is configured by the *name* of an environment variable: the API's database
-URL, its token and Temporal Cloud API key ([`examples/repoplane-api.yaml`](examples/repoplane-api.yaml)); a
-connection's forge token (`--token-env`, read only by the worker); the CLI's API token
-([`examples/contexts.yaml`](examples/contexts.yaml)). No flag takes a secret, and one pasted
-where a name belongs is refused.
+URL, its token and Temporal Cloud API key ([`examples/repoplane-api.yaml`](examples/repoplane-api.yaml)); the
+worker's forge tokens, each keyed by the host and organisation it may be sent to
+([`examples/repoplane-worker.yaml`](examples/repoplane-worker.yaml)), so a connection carries no
+credential at all; the CLI's API token ([`examples/contexts.yaml`](examples/contexts.yaml)). No
+flag takes a secret, and one pasted where a name belongs is refused.
 
 ## Development
 

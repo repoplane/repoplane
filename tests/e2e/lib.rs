@@ -83,7 +83,7 @@ pub struct ForgeSide {
     pub org: String,
     /// Azure DevOps: the project that repositories without a namespace go to.
     pub default_project: String,
-    /// The variable the repoplane connection names; the worker gets it in its environment.
+    /// The variable holding the forge token, for forgelab and for the worker's environment.
     pub token_env: String,
     token: SecretString,
     config_path: PathBuf,
@@ -199,10 +199,9 @@ impl ForgeSide {
             forge: self.forge,
             org: self.org.clone(),
             base_url: self.base_url.clone(),
-            token_env: self.token_env.clone(),
             queue: "default".into(),
         };
-        Ok(repoplane_forge::lister_with_token(
+        Ok(repoplane_forge::lister(
             &spec,
             repoplane_forge::Token::new(self.token.expose_secret())?,
             repoplane_forge::ReqwestTransport::new()?,
@@ -210,12 +209,16 @@ impl ForgeSide {
         )?)
     }
 
-    /// The token, for the worker's environment only.
-    pub fn worker_env(&self) -> (String, String) {
-        (
-            self.token_env.clone(),
-            self.token.expose_secret().to_string(),
-        )
+    /// The token as the worker holds it, for the worker only. It is keyed by the forge's host
+    /// alone, so it also goes to the fault proxies a scenario puts on another port of that host.
+    pub fn worker_token(&self) -> anyhow::Result<WorkerToken> {
+        let url = reqwest::Url::parse(&self.base_url)
+            .with_context(|| format!("base_url {:?}", self.base_url))?;
+        Ok(WorkerToken {
+            host: url.host_str().context("base_url has no host")?.to_string(),
+            var: self.token_env.clone(),
+            value: self.token.expose_secret().to_string().into(),
+        })
     }
 
     pub fn env(&self, fleet: &str) -> anyhow::Result<Env> {
@@ -409,6 +412,13 @@ async fn git(remote: &GitRemote, dir: &Path, args: &[&str]) -> anyhow::Result<St
 
 // --- the repoplane side: API, worker and CLI -----------------------------------------------
 
+/// The forge token a worker holds: where it may go, and the variable that carries it.
+pub struct WorkerToken {
+    pub host: String,
+    pub var: String,
+    value: SecretString,
+}
+
 pub struct Stack {
     pub api_url: String,
     api_token: String,
@@ -416,7 +426,7 @@ pub struct Stack {
     pub logs: PathBuf,
     /// The Temporal frontend, as `http://127.0.0.1:<port>`.
     pub temporal: String,
-    forge_token: (String, String),
+    forge_token: WorkerToken,
     _api: Child,
     worker: tokio::sync::Mutex<Option<Child>>,
     _temporal: ContainerAsync<GenericImage>,
@@ -489,7 +499,7 @@ impl Stack {
 
     /// Postgres and Temporal in containers; the API and the worker as real processes, the
     /// worker with the forge token in its environment and the API without it.
-    pub async fn start(forge_token: (String, String)) -> anyhow::Result<Stack> {
+    pub async fn start(forge_token: WorkerToken) -> anyhow::Result<Stack> {
         let bin = bin_dir();
         for b in ["repoplane-api", "repoplane-worker", "repoplane"] {
             if !bin.join(b).exists() {
@@ -646,9 +656,16 @@ impl Stack {
         worker
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env(&self.forge_token.0, &self.forge_token.1)
+            .env(
+                &self.forge_token.var,
+                self.forge_token.value.expose_secret(),
+            )
             .env("RUST_LOG", "info")
             .args(["--temporal-address", &self.temporal])
+            .args([
+                "--token",
+                &format!("{}={}", self.forge_token.host, self.forge_token.var),
+            ])
             .stdout(Stdio::null())
             .stderr(log);
         let mut cmd = Command::from(worker);

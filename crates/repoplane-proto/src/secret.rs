@@ -69,6 +69,6 @@ mod tests {
             "4f1c9a0b2e7d4c3a9b8e7f6d5c4b3a2f1e0d9c8b"
         ));
         assert!(!looks_like_secret("FORGELAB_GH_TOKEN"));
-        assert!(describe_env_name_error("--token-env", "ghp_abc").contains("looks like a token"));
+        assert!(describe_env_name_error("token_env", "ghp_abc").contains("looks like a token"));
     }
 }

@@ -1,10 +1,18 @@
 # repoplane-worker configuration. The worker runs the forge activities of the connections on its
-# queue. It makes outbound calls only — to Temporal, and to those connections' forges — and reads
-# each connection's forge token from the variable the connection names, in its own environment.
-# Every key is optional; these are the defaults.
+# queue. It makes outbound calls only — to Temporal, and to those connections' forges — and holds
+# their forge tokens: a connection carries none. Every key but `tokens` is optional; these are the
+# defaults.
 queue: default
 concurrency: 64                            # forge activities at once: the bound on fan-out
 temporal:
   address: http://localhost:7233
   namespace: default
   # api_key_env: TEMPORAL_API_KEY
+# Required: the forge tokens, each by where it may be sent, naming the variable that holds it
+# (or pass --token WHERE=VARIABLE). A connection gets the closest match: a key without a port
+# matches every port of its host, and one with an organisation covers a GitLab group's subgroups.
+# tokens:
+#   github.com: GITHUB_TOKEN
+#   github.com/acme-secure: GITHUB_ACME_SECURE_TOKEN
+#   gitlab.example.com/platform: GITLAB_PLATFORM_TOKEN
+#   dev.azure.com/acme: AZURE_DEVOPS_TOKEN

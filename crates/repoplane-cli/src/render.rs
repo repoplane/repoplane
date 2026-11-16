@@ -100,7 +100,6 @@ pub fn connection(c: &Connection) -> String {
         ("Org", c.org.clone()),
         ("Base URL", c.base_url.clone()),
         ("Auth", "token".into()),
-        ("Token env", c.token_env.clone()),
         ("Queue", c.queue.clone()),
         ("", String::new()),
         ("Repositories", c.repositories.to_string()),

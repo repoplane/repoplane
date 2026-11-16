@@ -23,7 +23,7 @@ async fn inventory() {
     let Some(sb) = sandbox() else { return };
     let side = ForgeSide::start(&sb).await.expect("start the forge side");
     side.prepare().await.expect("prepare the sandbox");
-    let stack = Stack::start(side.worker_env())
+    let stack = Stack::start(side.worker_token().expect("the worker's token"))
         .await
         .expect("start repoplane");
     eprintln!(
@@ -43,8 +43,6 @@ async fn inventory() {
         side.org.clone(),
         "--auth".into(),
         "token".into(),
-        "--token-env".into(),
-        side.token_env.clone(),
     ];
     if side.sandbox == "local" {
         add.extend(["--base-url".into(), side.base_url.clone()]);
@@ -101,6 +99,11 @@ async fn inventory() {
             "a refused token fails the run fast",
             false,
             Box::pin(refused(&s)),
+        ),
+        (
+            "a forge no worker holds a token for fails the run fast",
+            false,
+            Box::pin(no_token(&s)),
         ),
         ("topic changed", true, Box::pin(topic_changed(&s))),
         ("commit pushed", true, Box::pin(commit_pushed(&s))),
@@ -440,8 +443,6 @@ async fn shifting_listing(s: &Suite) -> anyhow::Result<()> {
             &s.side.org,
             "--auth",
             "token",
-            "--token-env",
-            &s.side.token_env,
             "--base-url",
             &proxy.base_url,
         ])
@@ -659,8 +660,6 @@ async fn rate_limited(s: &Suite) -> anyhow::Result<()> {
             &s.side.org,
             "--auth",
             "token",
-            "--token-env",
-            &s.side.token_env,
             "--base-url",
             &proxy.base_url,
         ])
@@ -702,8 +701,6 @@ async fn refused(s: &Suite) -> anyhow::Result<()> {
             &s.side.org,
             "--auth",
             "token",
-            "--token-env",
-            &s.side.token_env,
             "--base-url",
             &proxy.base_url,
         ])
@@ -728,6 +725,58 @@ async fn refused(s: &Suite) -> anyhow::Result<()> {
     anyhow::ensure!(
         begun.elapsed() < std::time::Duration::from_secs(30),
         "failing took {:?}: a 401 must not be retried",
+        begun.elapsed()
+    );
+    Ok(())
+}
+
+/// A connection cannot have a worker send its token anywhere the worker's keys do not name: a
+/// forge no worker holds a token for fails the run at once, saying which host lacks one.
+async fn no_token(s: &Suite) -> anyhow::Result<()> {
+    if s.side.sandbox != "local" {
+        eprintln!("skipped: only on the local sandbox");
+        return Ok(());
+    }
+    // The worker holds a token for 127.0.0.1; localhost is the same machine, but not that key.
+    let conn = "e2e-local-no-token";
+    s.stack
+        .cli(&[
+            "connection",
+            "add",
+            "forgejo",
+            "--name",
+            conn,
+            "--org",
+            &s.side.org,
+            "--base-url",
+            "http://localhost:1",
+        ])
+        .await?;
+    let begun = std::time::Instant::now();
+    let out = s
+        .stack
+        .cli(&[
+            "connection",
+            "reconcile",
+            conn,
+            "--wait",
+            "--timeout",
+            "2m",
+            "--output",
+            "json",
+        ])
+        .await;
+    let Err(err) = out else {
+        anyhow::bail!("a reconcile with no token for its forge succeeded");
+    };
+    let err = err.to_string();
+    anyhow::ensure!(
+        err.contains("\"failed\"") && err.contains("hold no token for localhost:1/"),
+        "{err}"
+    );
+    anyhow::ensure!(
+        begun.elapsed() < std::time::Duration::from_secs(30),
+        "failing took {:?}: a missing token must not be retried",
         begun.elapsed()
     );
     Ok(())

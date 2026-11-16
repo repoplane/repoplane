@@ -56,8 +56,8 @@ flowchart LR
 |---|---|---|---|
 | `repoplane` (CLI) | nothing | the API's `/v1` | touches the database, Temporal or a forge; links none of them |
 | `repoplane-api` | Postgres: connections, inventory, runs; migrations. Runs the workflows and the Postgres activities | Postgres; Temporal; serves `/v1` | calls a forge; holds a forge credential |
-| `repoplane-worker` | the forge tokens (read from the variables each connection names) | Temporal, outbound; forges | opens a database; calls the repoplane API; accepts a connection |
-| Temporal | process state: what step each run is at, timers, retries, signals | — | holds a secret (inputs carry variable *names*) |
+| `repoplane-worker` | the forge tokens, each keyed by the host and organisation it may be sent to ([ADR 0014](adr/0014-the-worker-chooses-each-connections-token.md)) | Temporal, outbound; forges | opens a database; calls the repoplane API; accepts a connection |
+| Temporal | process state: what step each run is at, timers, retries, signals | — | holds a secret (a connection carries no credential) |
 
 **Temporal orchestrates; Postgres is product state** ([ADR 0012](adr/0012-temporal-orchestrates.md)).
 A run is a Temporal workflow whose id is the run's id (`rec_…`, `hrf_…`). Each of its steps is an
@@ -109,7 +109,8 @@ scheduled in one workflow stalled it. A child's history is about 4,000 events pe
 repositories, well under Temporal's 51,200.
 
 Forge steps retry 8 times, backing off from 1s to 60s. A failure the worker marks non-retryable
-(a refused token, a missing variable, a protocol violation) fails the run at once. The run's
+(a refused token, a forge the worker holds no token for, a protocol violation) fails the run at
+once. The run's
 record then says why, from the forge's own message.
 
 Every activity's input and output lives in workflow history, so none carries a secret: a
@@ -228,8 +229,11 @@ run's id is also its Temporal workflow id.
 Secrets are named, never written:
 - The API's config names the variables that hold its database URL, its token and, for
   Temporal Cloud, the Temporal API key.
-- A connection stores the *name* of the variable that holds its forge token. Only a worker
-  reads it, inside the activity, so it never enters workflow history.
+- A worker's config names the variables holding its forge tokens, each keyed by where it may
+  be sent: `host`, `host:port`, `host/org` or `host:port/org`. A connection carries no
+  credential, not even a name: the worker chooses the token by the connection's host and
+  organisation, so a token never enters workflow history and never goes to a host its key does
+  not name ([ADR 0014](adr/0014-the-worker-chooses-each-connections-token.md)).
 - The CLI's contexts file names the variable that holds the API token.
 
 No flag takes a secret, and a value that looks like one is refused where a variable name is
@@ -253,6 +257,8 @@ expected.
     token (fails fast).
   - A fourth local scenario kills the worker in the middle of a run; the run waits, and
     completes when a worker returns.
+  - A fifth adds a connection to a host the worker holds no token for: the run fails at once,
+    naming the host.
 
 ## Known gaps
 

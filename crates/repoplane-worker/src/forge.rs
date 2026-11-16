@@ -1,6 +1,6 @@
 //! The forge activities: the steps of a workflow that talk to a forge, run on the connection's
-//! queue. Each one reads the connection's token from this process's environment — the name of
-//! the variable is all the workflow ever carried — and does one thing: list a page, look
+//! queue. Each one takes the token this worker holds for the connection's forge — the workflow
+//! carries no credential, not even the name of one — and does one thing: list a page, look
 //! repositories up by id, or read HEADs.
 
 use std::sync::Arc;
@@ -13,8 +13,12 @@ use temporalio_sdk::ApplicationFailure;
 use temporalio_sdk::activities::{ActivityContext, ActivityError};
 use tokio_util::sync::CancellationToken;
 
+use crate::tokens::Tokens;
+
 pub struct ForgeActivities {
     pub transport: Arc<dyn Transport>,
+    /// The forge tokens this worker holds; each connection gets the one meant for its forge.
+    pub tokens: Arc<Tokens>,
 }
 
 /// A forge error as Temporal should treat it: retried when the forge was busy or unreachable,
@@ -31,7 +35,8 @@ pub fn failure(e: ForgeError) -> ActivityError {
 
 impl ForgeActivities {
     fn lister(&self, c: &ConnectionSpec) -> Result<Box<dyn Lister>, ActivityError> {
-        repoplane_forge::lister(c, self.transport.clone(), CancellationToken::new())
+        let token = self.tokens.for_connection(c).map_err(failure)?;
+        repoplane_forge::lister(c, token, self.transport.clone(), CancellationToken::new())
             .map_err(failure)
     }
 }

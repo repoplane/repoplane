@@ -10,7 +10,8 @@ use crate::id::{ConnectionId, HeadRefreshId, ReconcileId, RepositoryId, SyncId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
-    /// A personal or service token, read by the worker from the variable `token_env` names.
+    /// A service token, held by the workers on the connection's queue, which choose it by the
+    /// forge's host and the organisation.
     Token,
 }
 
@@ -24,8 +25,6 @@ pub struct CreateConnection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     pub auth: AuthMode,
-    /// The NAME of the variable holding the token, in the worker's environment.
-    pub token_env: String,
     /// The task queue whose workers serve this connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
@@ -39,7 +38,6 @@ pub struct Connection {
     pub org: String,
     pub base_url: String,
     pub auth: AuthMode,
-    pub token_env: String,
     pub queue: String,
     pub created_at: DateTime<Utc>,
     pub repositories: i64,
