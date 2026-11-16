@@ -30,6 +30,8 @@ async fn runs() {
     a_late_failure_does_not_undo_a_success(&store).await;
     a_sync_requests_its_refresh_once(&store).await;
     a_failed_sync_fails_the_step_in_flight(&store).await;
+    a_repository_refused_is_unread_and_keeps_its_head(&store).await;
+    a_refresh_refused_everything_fails(&store).await;
 }
 
 async fn start() -> (ContainerAsync<GenericImage>, Store) {
@@ -92,6 +94,15 @@ fn head(id: &str, branch: &str, sha: char) -> ObservedHead {
         external_id: id.into(),
         branch: Some(branch.into()),
         head: Some(sha.to_string().repeat(40)),
+        unread: None,
+    }
+}
+fn unread(id: &str, branch: &str) -> ObservedHead {
+    ObservedHead {
+        external_id: id.into(),
+        branch: Some(branch.into()),
+        head: None,
+        unread: Some("git ls-remote: 403 You are not allowed to download code".into()),
     }
 }
 async fn heads_of(store: &Store, c: &Connection) -> Vec<(String, Option<String>)> {
@@ -357,4 +368,56 @@ async fn a_failed_sync_fails_the_step_in_flight(store: &Store) {
         h.error.as_deref(),
         Some("the sync stopped: the workflow was terminated")
     );
+}
+
+/// A repository the forge would not let the token read is counted unread once, however often
+/// Temporal repeats the step, named with its reason, and keeps the HEAD recorded before; the
+/// refresh succeeds with the others.
+async fn a_repository_refused_is_unread_and_keeps_its_head(store: &Store) {
+    let c = connection(store, "q-unread").await;
+    reconcile(store, &c, &[repo("a", "main", &[]), repo("b", "main", &[])]).await;
+    let (first, _) = refresh(store, &c, RefreshHeads::default()).await;
+    store
+        .record_heads(first, &[head("a", "main", '1'), head("b", "main", '2')])
+        .await
+        .unwrap();
+    store.finish_refresh(first).await.unwrap();
+
+    let (r, _) = refresh(store, &c, RefreshHeads::default()).await;
+    for _ in 0..2 {
+        store
+            .record_heads(r, &[head("a", "main", '3'), unread("b", "main")])
+            .await
+            .unwrap();
+    }
+    store.finish_refresh(r).await.unwrap();
+    let r = store.head_refresh(r).await.unwrap();
+    assert_eq!(r.status, RunStatus::Succeeded);
+    assert_eq!((r.targeted, r.observed, r.unread), (2, 1, 1));
+    assert_eq!(r.unread_repositories.len(), 1);
+    assert_eq!(r.unread_repositories[0].full_name, "org/b");
+    assert!(r.unread_repositories[0].reason.contains("403"));
+    let heads = heads_of(store, &c).await;
+    assert_eq!(
+        heads,
+        vec![
+            ("a".to_string(), Some("3".repeat(40))),
+            ("b".to_string(), Some("2".repeat(40))),
+        ]
+    );
+}
+
+/// A token every target refuses (a missing scope) is the token's problem: the refresh fails,
+/// saying so, rather than succeeding with nothing read.
+async fn a_refresh_refused_everything_fails(store: &Store) {
+    let c = connection(store, "q-refused").await;
+    reconcile(store, &c, &[repo("a", "main", &[]), repo("b", "main", &[])]).await;
+    let (r, _) = refresh(store, &c, RefreshHeads::default()).await;
+    store
+        .record_heads(r, &[unread("a", "main"), unread("b", "main")])
+        .await
+        .unwrap();
+    let e = store.finish_refresh(r).await.unwrap_err().to_string();
+    assert!(e.contains("none of 2 HEADs: 2 repositories refused"), "{e}");
+    assert!(e.contains("org/a: git ls-remote: 403"), "{e}");
 }

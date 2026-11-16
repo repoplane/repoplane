@@ -170,10 +170,27 @@ pub struct HeadRefresh {
     pub observed: i64,
     /// Repositories whose HEAD differs from the one recorded before.
     pub changed: i64,
+    /// Repositories the forge would not let the token read (a 403 on that repository alone).
+    /// The refresh goes on without them; it fails only if it could read none of its targets.
+    #[serde(default)]
+    pub unread: i64,
+    /// Some of them, with the forge's reason: at most [`UNREAD_SHOWN`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unread_repositories: Vec<UnreadRepository>,
     pub error: Option<String>,
     pub requested_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Unread repositories a head refresh names; its `unread` counts them all.
+pub const UNREAD_SHOWN: usize = 20;
+
+/// A repository whose HEAD a refresh could not read, and the forge's reason.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UnreadRepository {
+    pub full_name: String,
+    pub reason: String,
 }
 
 /// `connection sync`: a reconcile, then a head refresh of every active repository, as one run.

@@ -10,7 +10,7 @@ use std::time::Duration;
 use repoplane_flow::activities::{
     FORGE_ATTEMPTS, ListPage, ListedPage, Lookup, MAX_RATE_LIMIT_WAIT, ReadHead,
 };
-use repoplane_forge::{ForgeError, Listed, Lister, Transport};
+use repoplane_forge::{Class, ForgeError, Listed, Lister, Transport};
 use repoplane_proto::inventory::{ConnectionSpec, ObservedHead, RepoSnapshot};
 use temporalio_macros::activities;
 use temporalio_sdk::ApplicationFailure;
@@ -170,22 +170,32 @@ pub async fn lookup(lister: &dyn Lister, id: &str) -> Result<Option<RepoSnapshot
 
 /// The repository's default-branch HEAD, naming the branch it was read from. A failure is the
 /// activity's: Temporal retries it if it may pass, and fails the run if it will not.
+///
+/// A forge that will not let the token read this repository (a 403, where a 401 refuses the
+/// token) answers for it alone: the HEAD is reported unread, with the forge's reason, and the
+/// refresh goes on with the others.
 pub async fn read_head(
     lister: &dyn Lister,
     repo: RepoSnapshot,
 ) -> Result<ObservedHead, ForgeError> {
     let listed = [Listed { snapshot: repo }];
-    let head = lister
+    let answer = lister
         .heads(&listed)
         .await
         .into_iter()
         .next()
-        .ok_or_else(|| ForgeError::protocol("worker", "heads() answered for no repository"))??;
+        .ok_or_else(|| ForgeError::protocol("worker", "heads() answered for no repository"))?;
     let [Listed { snapshot }] = listed;
+    let (head, unread) = match answer {
+        Ok(head) => (head, None),
+        Err(e) if e.class() == Some(Class::Forbidden) => (None, Some(e.to_string())),
+        Err(e) => return Err(e),
+    };
     Ok(ObservedHead {
         external_id: snapshot.external_id,
         branch: snapshot.default_branch,
         head,
+        unread,
     })
 }
 
@@ -270,6 +280,23 @@ mod tests {
         assert_eq!(head.branch.as_deref(), Some("main"));
         assert_eq!(head.head, Some("a".repeat(40)));
         assert_eq!(fake.asked(), vec!["heads 1"]);
+    }
+
+    /// A repository the forge will not let the token read is reported unread, with the
+    /// forge's reason, rather than failing the refresh; a refused token still fails it.
+    #[tokio::test]
+    async fn a_forbidden_repository_is_unread_not_a_failure() {
+        let fake = Fake::new(HashMap::new()).forbidden("4").failing("5", false);
+        let head = read_head(&fake, listed("4", "d").snapshot).await.unwrap();
+        assert_eq!(head.head, None);
+        assert!(
+            head.unread.as_deref().is_some_and(|r| r.contains("403")),
+            "{:?}",
+            head.unread
+        );
+        assert!(read_head(&fake, listed("5", "e").snapshot).await.is_err());
+        let read = read_head(&fake, listed("6", "f").snapshot).await.unwrap();
+        assert!(read.head.is_some() && read.unread.is_none());
     }
 
     /// A transient failure stays retryable, for Temporal to retry; a refusal does not.

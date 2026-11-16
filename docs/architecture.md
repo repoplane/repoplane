@@ -172,7 +172,12 @@ never reads a HEAD. When it sees a repository's default branch change, it clears
 HEAD, because that HEAD described another branch. A head refresh reads the HEADs of the
 repositories it was given, and stamps each with `head_observed_at`. The HEAD column above is
 therefore the cost of a refresh, paid only for its targets. An empty repository records
-`head: null` (`—` in the CLI); that is a fact about the repository, not a failed read.
+`head: null` (`—` in the CLI); that is a fact about the repository, not a failed read. A
+repository the forge will not let the token read (a 403 on it alone, as GitLab answers a Guest
+of a private project) is *unread*: its last known HEAD stays, and the refresh goes on, counting
+it and naming it with the forge's reason. A refresh the forge gives no HEAD at all, refusing it
+some, fails: a token every repository refuses is the token's problem. A 401 refuses the token
+itself, and fails the run at once.
 
 **HEADs are read over git, not over the API.** One `git ls-remote <remote> refs/heads/<branch>`
 per repository, one activity each, as many at once as the worker has slots. Git traffic is not counted against the REST and GraphQL

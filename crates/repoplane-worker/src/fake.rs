@@ -13,6 +13,8 @@ pub struct Fake {
     asked: Mutex<Vec<String>>,
     /// Repositories whose HEAD read fails, and whether that failure is retryable.
     failing: HashMap<String, bool>,
+    /// Repositories the forge will not let the token read (a 403).
+    forbidden: std::collections::HashSet<String>,
 }
 
 impl Fake {
@@ -21,7 +23,14 @@ impl Fake {
             repos,
             asked: Mutex::new(Vec::new()),
             failing: HashMap::new(),
+            forbidden: Default::default(),
         }
+    }
+
+    /// Makes the forge refuse the token `id`'s HEAD, and only that one.
+    pub fn forbidden(mut self, id: &str) -> Fake {
+        self.forbidden.insert(id.to_string());
+        self
     }
 
     /// Makes reading `id`'s HEAD fail, retryably or not.
@@ -75,6 +84,14 @@ impl Lister for Fake {
         repos
             .iter()
             .map(|r| match self.failing.get(&r.snapshot.external_id) {
+                _ if self.forbidden.contains(&r.snapshot.external_id) => Err(ForgeError::Status {
+                    forge: "fake",
+                    class: repoplane_forge::Class::Forbidden,
+                    status: 403,
+                    method: "git ls-remote".into(),
+                    path: "/".into(),
+                    body: "You are not allowed to download code from this project.".into(),
+                }),
                 Some(true) => Err(ForgeError::Transport {
                     forge: "fake",
                     method: "git ls-remote".into(),

@@ -8,7 +8,7 @@ use std::pin::Pin;
 use forgelab::forge::Settings;
 use repoplane_e2e::{ForgeProxy, ForgeSide, Stack, compare, expected, sandbox};
 use repoplane_proto::ForgeKind;
-use repoplane_proto::api::RepositoryStatus;
+use repoplane_proto::api::{HeadRefresh, RepositoryStatus};
 
 type Scenario<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>>;
 
@@ -99,6 +99,11 @@ async fn inventory() {
             "a refused token fails the run fast",
             false,
             Box::pin(refused(&s)),
+        ),
+        (
+            "a repository the token may not read is unread, not a failure",
+            false,
+            Box::pin(unreadable(&s)),
         ),
         (
             "connection add refuses what no worker can serve",
@@ -867,6 +872,83 @@ async fn no_token(s: &Suite) -> anyhow::Result<()> {
         begun.elapsed()
     );
     Ok(())
+}
+
+/// A repository the forge will not let the token read (a 403 on it alone) is reported unread,
+/// with the forge's reason, and the refresh succeeds with the others; a token every repository
+/// refuses fails the refresh, saying so.
+async fn unreadable(s: &Suite) -> anyhow::Result<()> {
+    if s.side.sandbox != "local" {
+        eprintln!("skipped: only on the local sandbox");
+        return Ok(());
+    }
+    let proxy = ForgeProxy::start(&s.side).await?;
+    let conn = "e2e-local-unreadable";
+    s.stack
+        .cli(&[
+            "connection",
+            "add",
+            "forgejo",
+            "--name",
+            conn,
+            "--org",
+            &s.side.org,
+            "--base-url",
+            &proxy.base_url,
+        ])
+        .await?;
+    s.stack.reconcile(conn).await?;
+    let refresh = [
+        "repo",
+        "refresh-heads",
+        "--connection",
+        conn,
+        "--wait",
+        "--timeout",
+        "5m",
+    ];
+
+    proxy.refuse_git(Some("billing-api"));
+    let one = async {
+        let mut runs: Vec<HeadRefresh> = s.stack.cli_json(&refresh).await?;
+        let r = runs.pop().ok_or_else(|| anyhow::anyhow!("no refresh"))?;
+        anyhow::ensure!(
+            r.status.as_str() == "succeeded" && r.unread == 1 && r.observed == r.targeted - 1,
+            "one repository refused: {} targeted {} observed {} unread {} error {:?}",
+            r.status.as_str(),
+            r.targeted,
+            r.observed,
+            r.unread,
+            r.error
+        );
+        let named = &r.unread_repositories;
+        anyhow::ensure!(
+            named.len() == 1
+                && named[0].full_name.ends_with("/billing-api")
+                && named[0].reason.contains("403"),
+            "unread named {named:?}"
+        );
+        Ok(())
+    }
+    .await;
+
+    proxy.refuse_git(Some("*"));
+    let all = async {
+        let mut runs: Vec<HeadRefresh> = s.stack.cli_json_failing(&refresh).await?;
+        let r = runs.pop().ok_or_else(|| anyhow::anyhow!("no refresh"))?;
+        anyhow::ensure!(
+            r.status.as_str() == "failed"
+                && r.error.as_deref().is_some_and(|e| e.contains("refused it")),
+            "every repository refused: {} unread {} error {:?}",
+            r.status.as_str(),
+            r.unread,
+            r.error
+        );
+        Ok(())
+    }
+    .await;
+    proxy.refuse_git(None);
+    one.and(all)
 }
 
 /// A topic added on the forge shows up after the next reconcile, and nothing else moves.

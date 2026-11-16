@@ -42,7 +42,7 @@ pub struct HeadTarget {
     pub repo: RepoSnapshot,
 }
 
-/// A default-branch HEAD as the forge answered it; `None` for an empty or unreadable one.
+/// A default-branch HEAD as the forge answered it; `None` for an empty repository.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ObservedHead {
     pub external_id: String,
@@ -50,6 +50,10 @@ pub struct ObservedHead {
     /// branch, this HEAD describes the old one and is dropped.
     pub branch: Option<String>,
     pub head: Option<String>,
+    /// Why the forge would not let this token read this repository, when it would not (a
+    /// 403): the HEAD is not known, and the one recorded before stays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<String>,
 }
 
 /// A repository the inventory holds as active that a reconcile's listing did not return. A
