@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use repoplane_proto::ForgeKind;
 use repoplane_proto::api::{AuthMode, Connection, CreateConnection, Reconcile, RunStatus};
 use repoplane_proto::id::{ConnectionId, OrgId, ReconcileId};
+use repoplane_proto::inventory::ConnectionSpec;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
@@ -91,11 +92,15 @@ impl Store {
 
     // --- connections -------------------------------------------------------------------
 
-    pub async fn create_connection(&self, c: &CreateConnection) -> Result<Connection> {
-        validate_connection(c)?;
-        let base_url = normalize_base_url(c.forge, c.base_url.as_deref())?;
-        let queue = c.queue.clone().unwrap_or_else(|| "default".into());
-        let id = ConnectionId::new();
+    /// Records a connection under `id`, as [`connection_spec`] describes it.
+    pub async fn create_connection(
+        &self,
+        id: ConnectionId,
+        c: &CreateConnection,
+    ) -> Result<Connection> {
+        let ConnectionSpec {
+            base_url, queue, ..
+        } = connection_spec(id, c)?;
         let res = sqlx::query(
             "insert into connections (id, organization_id, name, forge, org, base_url, auth, queue)
              values ($1, $2, $3, $4, $5, $6, 'token', $7)",
@@ -214,6 +219,19 @@ impl Store {
 
 // --- validation ------------------------------------------------------------------------
 
+/// A connection as it would be recorded under `id`, checked and normalised: what reaching it
+/// takes, so it can be checked before it is recorded.
+pub fn connection_spec(id: ConnectionId, c: &CreateConnection) -> Result<ConnectionSpec> {
+    validate_connection(c)?;
+    Ok(ConnectionSpec {
+        id,
+        forge: c.forge,
+        org: c.org.clone(),
+        base_url: normalize_base_url(c.forge, c.base_url.as_deref())?,
+        queue: c.queue.clone().unwrap_or_else(|| "default".into()),
+    })
+}
+
 fn validate_connection(c: &CreateConnection) -> Result<()> {
     let bad = |m: String| Err(StoreError::Invalid(m));
     if c.name.is_empty()
@@ -330,6 +348,7 @@ impl ConnectionRow {
             created_at: self.created_at,
             repositories: self.repositories,
             last_reconciled_at: self.last_reconciled_at,
+            check: None,
         })
     }
 }

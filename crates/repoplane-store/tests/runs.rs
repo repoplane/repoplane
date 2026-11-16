@@ -8,7 +8,7 @@ use repoplane_proto::ForgeKind;
 use repoplane_proto::api::{
     AuthMode, Connection, CreateConnection, RefreshHeads, RepositoryStatus, RunStatus,
 };
-use repoplane_proto::id::HeadRefreshId;
+use repoplane_proto::id::{ConnectionId, HeadRefreshId};
 use repoplane_proto::inventory::{ObservedHead, RepoSnapshot};
 use repoplane_store::{RepoFilter, Store};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -59,14 +59,18 @@ async fn start() -> (ContainerAsync<GenericImage>, Store) {
 }
 async fn connection(store: &Store, queue: &str) -> Connection {
     store
-        .create_connection(&CreateConnection {
-            name: queue.into(),
-            forge: ForgeKind::Forgejo,
-            org: queue.into(),
-            base_url: Some("http://forgejo.test".into()),
-            auth: AuthMode::Token,
-            queue: Some(queue.into()),
-        })
+        .create_connection(
+            ConnectionId::new(),
+            &CreateConnection {
+                name: queue.into(),
+                forge: ForgeKind::Forgejo,
+                org: queue.into(),
+                base_url: Some("http://forgejo.test".into()),
+                auth: AuthMode::Token,
+                queue: Some(queue.into()),
+                skip_check: false,
+            },
+        )
         .await
         .unwrap()
 }

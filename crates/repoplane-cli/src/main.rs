@@ -104,6 +104,10 @@ struct AddArgs {
     /// The task queue whose workers serve this connection.
     #[arg(long)]
     queue: Option<String>,
+    /// Adds the connection without first having a worker on its queue list the organisation:
+    /// for a connection whose workers are not deployed yet.
+    #[arg(long)]
+    no_check: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -207,6 +211,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                         Auth::Token => AuthMode::Token,
                     },
                     queue: a.queue,
+                    skip_check: a.no_check,
                 })
                 .await?;
             print(out, render::connection(&c), &c)?;

@@ -28,6 +28,20 @@ pub struct CreateConnection {
     /// The task queue whose workers serve this connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
+    /// Records the connection without first having a worker on its queue list the
+    /// organisation: for a connection whose workers are not deployed yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_check: bool,
+}
+
+/// What adding a connection checked: a worker on its queue listed the first page of the
+/// organisation with a token it holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConnectionCheck {
+    /// Repositories on that first page.
+    pub repositories: u64,
+    /// Whether more pages follow.
+    pub more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -42,6 +56,9 @@ pub struct Connection {
     pub created_at: DateTime<Utc>,
     pub repositories: i64,
     pub last_reconciled_at: Option<DateTime<Utc>>,
+    /// Only in the answer to adding the connection, unless the check was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<ConnectionCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

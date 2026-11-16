@@ -10,7 +10,7 @@
 //!   `repoplane-worker` on the connection's own queue, which may run inside a customer's network.
 //!
 //! Every input and output here is recorded in workflow history, so none may hold a secret: a
-//! connection names the variable that holds its token, and only a forge activity reads it.
+//! connection carries no credential, and only a forge activity takes the token its worker holds.
 
 pub mod activities;
 pub mod temporal;
@@ -19,7 +19,8 @@ mod workflows;
 pub use activities::{Control, Forge};
 pub use temporal::{TemporalConfig, TemporalError};
 pub use workflows::{
-    LookupsWorkflow, ReadHeadsWorkflow, ReconcileWorkflow, RefreshHeadsWorkflow, SyncWorkflow,
+    CHECK_PICKUP, CHECK_TIMEOUT, CheckConnectionWorkflow, LookupsWorkflow, ReadHeadsWorkflow,
+    ReconcileWorkflow, RefreshHeadsWorkflow, SyncWorkflow,
 };
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,25 @@ pub struct ReadHeadsInput {
     pub refresh: HeadRefreshId,
     pub connection: ConnectionSpec,
     pub targets: Vec<HeadTarget>,
+}
+
+/// `connection add`'s check, run before the connection is recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckInput {
+    pub connection: ConnectionSpec,
+}
+
+/// What the check found. A connection that cannot work yet is an answer, not a failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum CheckOutcome {
+    /// A worker on the queue listed the first page: this many repositories, and maybe more.
+    Listed { repositories: u64, more: bool },
+    /// No worker took the check from the queue within [`CHECK_PICKUP`].
+    NoWorker,
+    /// A worker took it and could not list: no token for the forge, a refused token, a forge
+    /// that did not answer. In the words of whichever said so.
+    Failed { message: String },
 }
 
 /// The workflow id of a run: its domain id, so a run is found in Temporal by the id the API
