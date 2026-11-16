@@ -101,7 +101,7 @@ async fn inventory() {
             Box::pin(refused(&s)),
         ),
         (
-            "a forge no worker holds a token for fails the run fast",
+            "connection add refuses what no worker can serve",
             false,
             Box::pin(no_token(&s)),
         ),
@@ -730,8 +730,10 @@ async fn refused(s: &Suite) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A connection cannot have a worker send its token anywhere the worker's keys do not name: a
-/// forge no worker holds a token for fails the run at once, saying which host lacks one.
+/// `connection add` has a worker on the connection's queue list the organisation first, and
+/// refuses, saying why, a connection no worker can serve: a host no worker holds a token for (a
+/// connection cannot have a worker send its token anywhere else), or a queue no worker serves.
+/// `--no-check` adds it anyway, and its first run then fails at once.
 async fn no_token(s: &Suite) -> anyhow::Result<()> {
     if s.side.sandbox != "local" {
         eprintln!("skipped: only on the local sandbox");
@@ -739,8 +741,8 @@ async fn no_token(s: &Suite) -> anyhow::Result<()> {
     }
     // The worker holds a token for 127.0.0.1; localhost is the same machine, but not that key.
     let conn = "e2e-local-no-token";
-    s.stack
-        .cli(&[
+    let add = |extra: &'static [&'static str]| {
+        let mut args = vec![
             "connection",
             "add",
             "forgejo",
@@ -748,9 +750,54 @@ async fn no_token(s: &Suite) -> anyhow::Result<()> {
             conn,
             "--org",
             &s.side.org,
+        ];
+        args.extend_from_slice(extra);
+        args
+    };
+    let refused = |err: anyhow::Error, why: &str| {
+        let err = err.to_string();
+        anyhow::ensure!(
+            err.contains(why) && err.contains("The connection was not added"),
+            "{err}"
+        );
+        Ok(())
+    };
+
+    let begun = std::time::Instant::now();
+    let Err(err) = s
+        .stack
+        .cli(&add(&["--base-url", "http://localhost:1"]))
+        .await
+    else {
+        anyhow::bail!("a connection to a host no worker holds a token for was added");
+    };
+    refused(err, "hold no token for localhost:1/")?;
+    anyhow::ensure!(
+        begun.elapsed() < std::time::Duration::from_secs(30),
+        "refusing took {:?}: a missing token must not be retried",
+        begun.elapsed()
+    );
+
+    let Err(err) = s
+        .stack
+        .cli(&add(&[
             "--base-url",
             "http://localhost:1",
-        ])
+            "--queue",
+            "nobody",
+        ]))
+        .await
+    else {
+        anyhow::bail!("a connection on a queue no worker serves was added");
+    };
+    refused(err, "no worker on queue \"nobody\"")?;
+    anyhow::ensure!(
+        s.stack.cli(&["connection", "show", conn]).await.is_err(),
+        "a refused connection was recorded"
+    );
+
+    s.stack
+        .cli(&add(&["--base-url", "http://localhost:1", "--no-check"]))
         .await?;
     let begun = std::time::Instant::now();
     let out = s

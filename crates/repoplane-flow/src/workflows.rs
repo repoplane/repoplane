@@ -12,7 +12,9 @@ use temporalio_workflow::common::error::{
     ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
     ChildWorkflowStartError,
 };
+use temporalio_workflow::common::protos::temporal::api::enums::v1::TimeoutType;
 use temporalio_workflow::common::protos::temporal::api::failure::v1::Failure;
+use temporalio_workflow::common::protos::temporal::api::failure::v1::failure::FailureInfo;
 use temporalio_workflow::{RetryPolicy, WorkflowTermination, join_all};
 
 use repoplane_proto::inventory::ConnectionSpec;
@@ -22,8 +24,8 @@ use crate::activities::{
     RefreshFailed, SyncFailed,
 };
 use crate::{
-    CONTROL_QUEUE, LookupsInput, ReadHeadsInput, ReconcileInput, RefreshHeadsInput, SyncInput,
-    workflow_id,
+    CONTROL_QUEUE, CheckInput, CheckOutcome, LookupsInput, ReadHeadsInput, ReconcileInput,
+    RefreshHeadsInput, SyncInput, workflow_id,
 };
 
 // No batch sizes for speed: a workflow schedules its pages, lookups and HEAD reads at once, and
@@ -49,6 +51,28 @@ fn forge(c: &ConnectionSpec) -> ActivityOptions {
                 .backoff_coefficient(2.0)
                 .maximum_interval(Duration::from_secs(60))
                 .maximum_attempts(8)
+                .build(),
+        )
+        .build()
+}
+
+/// How long `connection add`'s check waits for a worker on the queue to take it. A busy worker
+/// takes it too: the check is one call among the hundreds a sync queues.
+pub const CHECK_PICKUP: Duration = Duration::from_secs(15);
+
+/// How long the check may take in all, retries included.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// The check's one forge call: a few quick attempts, since someone is waiting on it.
+fn check(c: &ConnectionSpec) -> ActivityOptions {
+    ActivityOptions::with_schedule_to_close_timeout(CHECK_TIMEOUT)
+        .schedule_to_start_timeout(CHECK_PICKUP)
+        .task_queue(c.queue.clone())
+        .retry_policy(
+            RetryPolicy::builder()
+                .initial_interval(Duration::from_secs(1))
+                .backoff_coefficient(2.0)
+                .maximum_attempts(3)
                 .build(),
         )
         .build()
@@ -114,6 +138,64 @@ fn describe(top: Option<&Failure>, e: &dyn std::fmt::Display) -> String {
         f = cause;
     }
     parts.join(": ")
+}
+
+/// The kind of timeout under a failure, if a timeout is what it was.
+fn timed_out(top: Option<&Failure>) -> Option<TimeoutType> {
+    let mut f = top?;
+    loop {
+        if let Some(FailureInfo::TimeoutFailureInfo(t)) = &f.failure_info {
+            return TimeoutType::try_from(t.timeout_type).ok();
+        }
+        f = f.cause.as_deref()?;
+    }
+}
+
+/// `connection add`'s check, before the connection is recorded: a worker on its queue lists
+/// the first page of the organisation. That takes a worker serving the queue, a token it holds
+/// for the forge, and that token seeing the organisation. The workflow always completes; its
+/// result is the answer.
+#[workflow]
+#[derive(Default)]
+pub struct CheckConnectionWorkflow;
+
+#[workflow_methods]
+impl CheckConnectionWorkflow {
+    #[run(name = "check-connection")]
+    pub async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        input: CheckInput,
+    ) -> WorkflowResult<CheckOutcome> {
+        let c = &input.connection;
+        let listed = ctx
+            .execute_activity(
+                Forge::list_page,
+                ListPage {
+                    connection: c.clone(),
+                    cursor: None,
+                },
+                check(c),
+            )
+            .await;
+        Ok(match listed {
+            Ok(page) => CheckOutcome::Listed {
+                repositories: page.repos.len() as u64,
+                more: page.next.is_some() || page.rest.is_some_and(|r| !r.is_empty()),
+            },
+            Err(e) => match timed_out(e.failure()) {
+                Some(TimeoutType::ScheduleToStart) => CheckOutcome::NoWorker,
+                Some(_) => CheckOutcome::Failed {
+                    message: format!(
+                        "the forge did not answer within {}s",
+                        CHECK_TIMEOUT.as_secs()
+                    ),
+                },
+                None => CheckOutcome::Failed {
+                    message: describe(e.failure(), &e),
+                },
+            },
+        })
+    }
 }
 
 fn fail(message: String) -> WorkflowTermination {
@@ -491,4 +573,46 @@ async fn sync(ctx: &mut WorkflowContext<SyncWorkflow>, input: &SyncInput) -> Res
     ctx.execute_activity(Control::finish_sync, input.sync, control())
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temporalio_workflow::common::protos::temporal::api::failure::v1::{
+        ActivityFailureInfo, TimeoutFailureInfo,
+    };
+
+    /// An activity that timed out fails with the timeout as its cause: the check reads which
+    /// one, since only a schedule-to-start timeout means no worker took it.
+    #[test]
+    fn a_timeout_is_read_under_the_activity_failure() {
+        let failure = |timeout: TimeoutType| Failure {
+            message: "activity timed out".into(),
+            failure_info: Some(FailureInfo::ActivityFailureInfo(
+                ActivityFailureInfo::default(),
+            )),
+            cause: Some(Box::new(Failure {
+                failure_info: Some(FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo {
+                    timeout_type: timeout as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            timed_out(Some(&failure(TimeoutType::ScheduleToStart))),
+            Some(TimeoutType::ScheduleToStart)
+        );
+        assert_eq!(
+            timed_out(Some(&failure(TimeoutType::ScheduleToClose))),
+            Some(TimeoutType::ScheduleToClose)
+        );
+        let refused = Failure {
+            message: "401".into(),
+            ..Default::default()
+        };
+        assert_eq!(timed_out(Some(&refused)), None);
+        assert_eq!(timed_out(None), None);
+    }
 }

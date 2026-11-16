@@ -14,7 +14,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use repoplane_flow::{
-    LookupsWorkflow, ReadHeadsWorkflow, ReconcileWorkflow, RefreshHeadsWorkflow, SyncWorkflow,
+    CheckConnectionWorkflow, LookupsWorkflow, ReadHeadsWorkflow, ReconcileWorkflow,
+    RefreshHeadsWorkflow, SyncWorkflow,
 };
 use repoplane_store::Store;
 use temporalio_sdk::{Runtime, Worker, WorkerOptions};
@@ -80,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
                     .register_workflow::<LookupsWorkflow>()?
                     .register_workflow::<ReadHeadsWorkflow>()?
                     .register_workflow::<SyncWorkflow>()?
+                    .register_workflow::<CheckConnectionWorkflow>()?
                     .register_activities(control::ControlActivities {
                         store: store.clone(),
                     })

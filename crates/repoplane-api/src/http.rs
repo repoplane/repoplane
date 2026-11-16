@@ -12,15 +12,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use repoplane_flow::{
-    CONTROL_QUEUE, ReconcileInput, ReconcileWorkflow, RefreshHeadsInput, RefreshHeadsWorkflow,
-    SyncInput, SyncWorkflow, workflow_id,
+    CHECK_PICKUP, CONTROL_QUEUE, CheckConnectionWorkflow, CheckInput, CheckOutcome, ReconcileInput,
+    ReconcileWorkflow, RefreshHeadsInput, RefreshHeadsWorkflow, SyncInput, SyncWorkflow,
+    workflow_id,
 };
-use repoplane_proto::api::{Connection, RunStatus};
+use repoplane_proto::api::{Connection, ConnectionCheck, RunStatus};
 use repoplane_proto::api::{
     ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
     RepositoryList, Sync,
 };
-use repoplane_proto::id::{HeadRefreshId, ReconcileId, SyncId};
+use repoplane_proto::id::{ConnectionId, HeadRefreshId, ReconcileId, SyncId};
 use repoplane_proto::inventory::ConnectionSpec;
 use repoplane_store::{RepoFilter, Store, StoreError};
 use serde::Deserialize;
@@ -31,6 +32,8 @@ use temporalio_client::{
 };
 
 const MAX_RECONCILE_WAIT: Duration = Duration::from_secs(60);
+/// How long adding a connection waits on its check: the check's own budget, and some.
+const CHECK_WAIT: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(250);
 /// How often a run in flight is checked against its workflow while a request waits on it.
 const CHECK: Duration = Duration::from_secs(5);
@@ -175,14 +178,85 @@ async fn readyz(State(s): State<AppState>) -> ApiResult<&'static str> {
     Ok("ready")
 }
 
+/// Adding a connection first has a worker on its queue list the organisation, unless asked
+/// not to: a connection no worker can serve is refused, saying why, rather than recorded to
+/// fail at its first run.
 async fn create_connection(
     State(s): State<AppState>,
     h: HeaderMap,
     Json(body): Json<CreateConnection>,
 ) -> ApiResult<impl IntoResponse> {
     authorized(&s, &h)?;
-    let c = s.store.create_connection(&body).await?;
+    let id = ConnectionId::new();
+    let spec = repoplane_store::connection_spec(id, &body)?;
+    let check = if body.skip_check {
+        None
+    } else {
+        // A name already taken is refused before the check, not after it.
+        if s.store.connection(&body.name).await.is_ok() {
+            return Err(StoreError::Conflict(format!(
+                "a connection named {:?} already exists",
+                body.name
+            ))
+            .into());
+        }
+        Some(check_connection(&s, &spec).await?)
+    };
+    let mut c = s.store.create_connection(id, &body).await?;
+    c.check = check;
     Ok((StatusCode::CREATED, Json(c)))
+}
+
+/// Has a worker on the connection's queue list the first page of its organisation, through a
+/// workflow: the API never calls a forge (ADR 0002).
+async fn check_connection(s: &AppState, spec: &ConnectionSpec) -> ApiResult<ConnectionCheck> {
+    let refused = |why: String| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "check_failed",
+            format!("{why}. The connection was not added; --no-check adds it without this check"),
+        )
+    };
+    let unavailable = |why: String| {
+        tracing::error!("{why}");
+        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "temporal_unavailable", why)
+    };
+    let options = WorkflowStartOptions::new(CONTROL_QUEUE, format!("{}-check", spec.id))
+        .execution_timeout(CHECK_WAIT * 2)
+        .build();
+    let handle = s
+        .temporal
+        .start_workflow(
+            CheckConnectionWorkflow::run,
+            CheckInput {
+                connection: spec.clone(),
+            },
+            options,
+        )
+        .await
+        .map_err(|e| unavailable(format!("could not start the connection check: {e}")))?;
+    let outcome = tokio::time::timeout(CHECK_WAIT, handle.get_result(Default::default()))
+        .await
+        .map_err(|_| {
+            unavailable(format!(
+                "the connection check did not finish within {}s",
+                CHECK_WAIT.as_secs()
+            ))
+        })?
+        .map_err(|e| unavailable(format!("the connection check did not finish: {e}")))?;
+    match outcome {
+        CheckOutcome::Listed { repositories, more } => Ok(ConnectionCheck { repositories, more }),
+        CheckOutcome::NoWorker => Err(refused(format!(
+            "no worker on queue {:?} took the check within {}s: none is running, or none can \
+             take more work",
+            spec.queue,
+            CHECK_PICKUP.as_secs()
+        ))),
+        CheckOutcome::Failed { message } => Err(refused(format!(
+            "the workers on queue {:?} could not list {} at {}: {message}",
+            spec.queue, spec.org, spec.base_url
+        ))),
+    }
 }
 
 async fn list_connections(

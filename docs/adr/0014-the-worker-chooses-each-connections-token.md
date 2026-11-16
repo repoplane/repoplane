@@ -32,6 +32,8 @@ not a variable name, or holds its Temporal API key.
 - A token only ever goes to the host its key names, whatever a connection says. That holds in
   the hybrid deployment too, where the API is not run by the forge's owner.
 - Adding a connection to a new forge host or organisation takes two steps by two roles: the
-  workers' operator adds the token, then anyone adds the connection.
+  workers' operator adds the token, then anyone adds the connection. Adding it checks the
+  first step: a worker on its queue lists the organisation with the token it holds, or the
+  connection is refused, saying why (`--no-check` skips this, for workers not deployed yet).
 - Connections on the same host and organisation share a token.
 - When GitHub Apps arrive, the App key is held the same way (ADR 0003).

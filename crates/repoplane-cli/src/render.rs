@@ -118,6 +118,15 @@ pub fn connection(c: &Connection) -> String {
             out.push_str(&format!("{k:<17}{v}\n"));
         }
     }
+    if let Some(check) = &c.check {
+        out.push_str(&format!(
+            "{:<17}a worker on queue {} listed {}{} repositories\n",
+            "Checked",
+            c.queue,
+            check.repositories,
+            if check.more { "+" } else { "" }
+        ));
+    }
     out
 }
 
