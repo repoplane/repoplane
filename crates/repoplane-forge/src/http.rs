@@ -210,7 +210,7 @@ impl Default for RetryPolicy {
             budget: Duration::from_secs(10 * 60),
             base: Duration::from_millis(500),
             cap: Duration::from_secs(30),
-            default_rate_limit_wait: Duration::from_secs(60),
+            default_rate_limit_wait: crate::error::DEFAULT_RATE_LIMIT_WAIT,
             timeout: Duration::from_secs(30),
         }
     }

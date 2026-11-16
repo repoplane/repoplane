@@ -108,10 +108,13 @@ to child workflows of at most 1,000 each (ADR 0013). This was measured: 2,139 HE
 scheduled in one workflow stalled it. A child's history is about 4,000 events per 1,000
 repositories, well under Temporal's 51,200.
 
-Forge steps retry 8 times, backing off from 1s to 60s. A failure the worker marks non-retryable
-(a refused token, a forge the worker holds no token for, a protocol violation) fails the run at
-once. The run's
-record then says why, from the forge's own message.
+Forge steps retry 8 times, backing off from 1s to 60s. A forge that says it is rate limiting
+(a 429 over its API or over git) is retried after the wait it asked for, or a minute when it
+does not say, for up to 30 attempts: retrying within seconds lands in the same window and only
+spends the quota again. The rule is the same on every forge; only a forge that rate limits
+waits. A failure the worker marks non-retryable (a refused token, a forge the worker holds no
+token for, a protocol violation) fails the run at once. The run's record then says why, from
+the forge's own message.
 
 Every activity's input and output lives in workflow history, so none carries a secret: a
 connection travels as its *variable name*. A replay test replays recorded histories against the
@@ -166,7 +169,9 @@ per repository, one activity each, as many at once as the worker has slots. Git 
 budgets, which is what made API-read HEADs expensive:
 - GitHub limits GraphQL to 60 s of CPU time per minute, which caps HEADs read that way near 600 a
   minute, whatever the concurrency.
-- gitlab.com's Free plan allows 100 API requests a minute.
+- gitlab.com's Free plan allows 100 API requests a minute, and 100 git requests a minute
+  (git over HTTPS, LFS and its dependency proxy together): a large group's HEADs are read
+  through a few rate-limited retries, at that pace.
 - Azure DevOps meters load per user.
 
 How the remote is built:
@@ -257,8 +262,8 @@ is refused over `http://` unless the address is loopback, such as a TLS-terminat
   - Mutating scenarios change the real forge, assert the next run records exactly that, then
     forgelab resets and verifies the sandbox.
   - On local, three scenarios use a fault proxy in front of Forgejo: a listing that shifts under
-    a deletion, a rate limit longer than one call's budget (retried by Temporal), and a refused
-    token (fails fast).
+    a deletion, a rate limit longer than one call's budget (waited out as long as the forge
+    asked, never retried early), and a refused token (fails fast).
   - A fourth local scenario kills the worker in the middle of a run; the run waits, and
     completes when a worker returns.
   - A fifth adds a connection to a host the worker holds no token for: the run fails at once,
