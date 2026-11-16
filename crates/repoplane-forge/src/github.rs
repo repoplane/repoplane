@@ -21,9 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{Class, ForgeError};
 use crate::git::{self, GitAuth};
 use crate::http::{HttpClient, Transport, Verdict, classify_generic, header, retry_after};
-use crate::{
-    Listed, Lister, Page, Token, escape_segment, link, numeric_id, readable_branch, within,
-};
+use crate::{Listed, Lister, Page, Token, escape_segment, link, numeric_id, within};
 
 const FORGE: &str = "github";
 const PAGE_SIZE: u32 = 100;
@@ -201,14 +199,19 @@ impl Lister for Github {
     }
 
     /// `GET /repositories/{id}`: by id, so a rename or a transfer is followed rather than
-    /// mistaken for a deletion. A repository transferred to another owner is no longer ours.
+    /// mistaken for a deletion. A repository transferred to another owner is no longer ours,
+    /// nor is one the token may no longer see: a 403 that is no rate limit (moved to an
+    /// organisation enforcing SAML or an IP allow list), or a 451 (blocked for legal reasons).
+    /// Either would otherwise fail every reconcile, since it will answer the same way each time;
+    /// marked inaccessible, the repository comes back if the listing returns it.
     async fn get(&self, external_id: &str) -> Result<Option<Listed>, ForgeError> {
         let id = numeric_id(FORGE, external_id)?;
         let url = format!("{}/repositories/{id}", self.api);
         match self.http.get_json::<Repo>(&url).await {
             Ok((_, Some(r))) if within(&self.org, &r.full_name) => Ok(Some(r.into_listed())),
             Ok(_) => Ok(None),
-            Err(e) if e.class() == Some(Class::NotFound) => Ok(None),
+            Err(e) if matches!(e.class(), Some(Class::NotFound | Class::Forbidden)) => Ok(None),
+            Err(ForgeError::Status { status: 451, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -217,8 +220,12 @@ impl Lister for Github {
 impl Github {
     /// `{git base}/{owner}/{repo}.git`, built from the configured base, never from a URL the
     /// forge sent: the credential only ever goes to the host the connection names.
+    ///
+    /// Unlike the other forges, GitHub's `empty` is a guess ([`Repo::looks_empty`]), so a
+    /// repository that looks empty is asked anyway: git's answer, no ref, is the authoritative
+    /// one, and a wrong guess would otherwise leave its HEAD unread for good.
     fn remote(&self, s: &RepoSnapshot) -> Result<Option<git::Remote>, ForgeError> {
-        let Some(branch) = readable_branch(s) else {
+        let Some(branch) = s.default_branch.as_deref().filter(|b| !b.is_empty()) else {
             return Ok(None);
         };
         let (owner, name) = s
@@ -516,6 +523,66 @@ mod tests {
         );
         assert!(g.get("9").await.unwrap().is_none(), "deleted");
         assert!(g.get("x").await.is_err());
+    }
+
+    /// A repository moved where the token may not follow (an organisation enforcing SAML), or
+    /// blocked for legal reasons, is no longer ours rather than a failure every reconcile
+    /// repeats; a 403 that is a rate limit is still one, and still waits.
+    #[tokio::test]
+    async fn a_lookup_the_token_may_no_longer_see_is_gone_not_a_failure() {
+        let t = ScriptedTransport::new(|req| match req.uri().path() {
+            "/repositories/1" => ScriptedTransport::reply(
+                403,
+                r#"{"message":"Resource protected by organization SAML enforcement. You must grant your Personal Access token access to this organization."}"#,
+            ),
+            "/repositories/2" => ScriptedTransport::reply(
+                451,
+                r#"{"message":"Repository access blocked","block":{"reason":"dmca"}}"#,
+            ),
+            _ => {
+                // A primary budget reset an hour away: past a call's budget, so it is reported
+                // at once, with the wait, rather than slept out here.
+                let reset = (SystemTime::now() + Duration::from_secs(3600))
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .to_string();
+                ScriptedTransport::reply_with(
+                    403,
+                    r#"{"message":"API rate limit exceeded"}"#,
+                    &[
+                        ("x-ratelimit-remaining", "0"),
+                        ("x-ratelimit-reset", &reset),
+                    ],
+                )
+            }
+        });
+        let g = github(t);
+        assert!(g.get("1").await.unwrap().is_none(), "SAML");
+        assert!(g.get("2").await.unwrap().is_none(), "451");
+        let limited = g.get("3").await.unwrap_err();
+        assert!(limited.rate_limit_wait().is_some(), "{limited}");
+    }
+
+    /// GitHub's `empty` is a guess, so a repository that looks empty is still asked: a wrong
+    /// guess must not leave its HEAD unread for good. One with no default branch is not.
+    #[test]
+    fn a_repository_that_looks_empty_is_asked_anyway() {
+        let g = github(ScriptedTransport::new(|_| {
+            ScriptedTransport::reply(200, "[]")
+        }));
+        let mut r = repo(1, "fresh");
+        r["pushed_at"] = r["created_at"].clone();
+        let s = serde_json::from_value::<Repo>(r)
+            .unwrap()
+            .into_listed()
+            .snapshot;
+        assert!(s.empty, "the listing guesses it empty");
+        let remote = g.remote(&s).unwrap().unwrap();
+        assert_eq!(remote.branch, "main");
+        let mut none = s.clone();
+        none.default_branch = None;
+        assert!(g.remote(&none).unwrap().is_none());
     }
 
     /// The first page's `last` link names page 3: pages 2 and 3 can be fetched at once, but
