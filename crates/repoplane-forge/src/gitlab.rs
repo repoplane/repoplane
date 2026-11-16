@@ -53,7 +53,9 @@ impl Gitlab {
             b => b,
         };
         let mut headers = HeaderMap::new();
-        let (k, v) = header("private-token", token.expose())?;
+        // GitLab takes its tokens as a bearer too. In `Authorization`, the HTTP stack knows the
+        // header for a credential, as it does not know `PRIVATE-TOKEN`.
+        let (k, v) = header("authorization", &format!("Bearer {}", token.expose()))?;
         headers.insert(k, v);
         let (k, v) = header("accept", "application/json")?;
         headers.insert(k, v);
@@ -315,7 +317,11 @@ mod tests {
     #[tokio::test]
     async fn lists_a_nested_group_with_its_subgroups_across_pages() {
         let t = ScriptedTransport::new(|req| {
-            assert!(req.headers().get("private-token").unwrap().is_sensitive());
+            // The token goes as a bearer, a header every HTTP stack knows for a credential.
+            let auth = req.headers().get("authorization").unwrap();
+            assert_eq!(auth.to_str().unwrap(), "Bearer t");
+            assert!(auth.is_sensitive());
+            assert!(req.headers().get("private-token").is_none());
             let q = req.uri().query().unwrap_or("");
             if !q.contains("&page=2") {
                 ScriptedTransport::reply_with(

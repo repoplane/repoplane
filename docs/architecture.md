@@ -146,8 +146,10 @@ Every method is mandatory, so a forge that cannot do something says so explicitl
 `HttpClient` under all four adapters owns the retry budget (10 minutes per logical request),
 backoff with jitter, and waiting out a rate limit. Each adapter supplies its own **classifier**,
 because each forge signals a limit differently. The client also scrubs the token from every
-error. The ideas come from forgelab, but the code is written independently: forgelab's own
-design requires the harness to be *independently wrong* from the system it tests.
+error, and follows a redirect only within the forge's origin: one to another host is reported,
+not followed, so the token is never sent there. The ideas come from forgelab, but the code is
+written independently: forgelab's own design requires the harness to be *independently wrong*
+from the system it tests.
 
 | | Listing | Topics | Archived | git remote for HEADs |
 |---|---|---|---|---|
