@@ -7,9 +7,9 @@ mod runs;
 mod syncs;
 
 use chrono::{DateTime, Utc};
+use repoplane_proto::ForgeKind;
 use repoplane_proto::api::{AuthMode, Connection, CreateConnection, Reconcile, RunStatus};
 use repoplane_proto::id::{ConnectionId, OrgId, ReconcileId};
-use repoplane_proto::{ForgeKind, secret};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
@@ -97,8 +97,8 @@ impl Store {
         let queue = c.queue.clone().unwrap_or_else(|| "default".into());
         let id = ConnectionId::new();
         let res = sqlx::query(
-            "insert into connections (id, organization_id, name, forge, org, base_url, auth, token_env, queue)
-             values ($1, $2, $3, $4, $5, $6, 'token', $7, $8)",
+            "insert into connections (id, organization_id, name, forge, org, base_url, auth, queue)
+             values ($1, $2, $3, $4, $5, $6, 'token', $7)",
         )
         .bind(id.uuid())
         .bind(self.org.uuid())
@@ -106,7 +106,6 @@ impl Store {
         .bind(c.forge.as_str())
         .bind(&c.org)
         .bind(&base_url)
-        .bind(&c.token_env)
         .bind(&queue)
         .execute(&self.pool)
         .await;
@@ -244,9 +243,6 @@ fn validate_connection(c: &CreateConnection) -> Result<()> {
             c.org
         ));
     }
-    if !secret::valid_env_name(&c.token_env) {
-        return bad(secret::describe_env_name_error("token_env", &c.token_env));
-    }
     if c.auth != AuthMode::Token {
         return bad("only token auth is supported".into());
     }
@@ -279,7 +275,7 @@ pub fn normalize_base_url(forge: ForgeKind, given: Option<&str>) -> Result<Strin
         .is_some_and(|host| host.contains('@'))
     {
         return Err(StoreError::Invalid(
-            "base_url must not carry credentials; name the token with token_env".into(),
+            "base_url must not carry credentials: the workers hold the forge tokens".into(),
         ));
     }
     if rest.is_empty() || rest.contains(['?', '#']) {
@@ -293,13 +289,13 @@ pub fn normalize_base_url(forge: ForgeKind, given: Option<&str>) -> Result<Strin
 // --- rows ------------------------------------------------------------------------------
 
 const CONNECTION_SELECT: &str = "
-    select c.id, c.name, c.forge, c.org, c.base_url, c.auth, c.token_env, c.queue, c.created_at,
+    select c.id, c.name, c.forge, c.org, c.base_url, c.auth, c.queue, c.created_at,
            c.last_reconciled_at,
            (select count(*) from repositories r where r.connection_id = c.id and r.status = 'active') as repositories
     from connections c where c.organization_id = $1";
 
 const CONNECTION_SELECT_ALL: &str = "
-    select c.id, c.name, c.forge, c.org, c.base_url, c.auth, c.token_env, c.queue, c.created_at,
+    select c.id, c.name, c.forge, c.org, c.base_url, c.auth, c.queue, c.created_at,
            c.last_reconciled_at,
            (select count(*) from repositories r where r.connection_id = c.id and r.status = 'active') as repositories
     from connections c where c.organization_id = $1 order by c.name";
@@ -312,7 +308,6 @@ struct ConnectionRow {
     org: String,
     base_url: String,
     auth: String,
-    token_env: String,
     queue: String,
     created_at: DateTime<Utc>,
     last_reconciled_at: Option<DateTime<Utc>>,
@@ -331,7 +326,6 @@ impl ConnectionRow {
                 "token" => AuthMode::Token,
                 other => return Err(StoreError::Invalid(format!("unknown auth {other:?}"))),
             },
-            token_env: self.token_env,
             queue: self.queue,
             created_at: self.created_at,
             repositories: self.repositories,

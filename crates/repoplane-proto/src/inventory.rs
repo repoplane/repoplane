@@ -1,21 +1,20 @@
 //! What crosses a Temporal activity boundary: a connection as a worker needs it, and the
 //! repositories and HEADs it reports. Everything here ends up in workflow history, so nothing
-//! here may be a secret — a connection names the variable that holds its token, never the token.
+//! here may be a secret — a connection carries no credential, not even the name of one.
 
 use serde::{Deserialize, Serialize};
 
 use crate::forge::ForgeKind;
 use crate::id::ConnectionId;
 
-/// Everything a worker needs to reach a forge, except the secret: that stays in the worker's
-/// environment, under the name given here.
+/// Everything a worker needs to reach a forge, except the token: the worker holds that, and
+/// chooses it by the forge's host and the organisation (ADR 0014).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConnectionSpec {
     pub id: ConnectionId,
     pub forge: ForgeKind,
     pub org: String,
     pub base_url: String,
-    pub token_env: String,
     /// The task queue whose workers serve this connection's forge activities.
     pub queue: String,
 }

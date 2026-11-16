@@ -1,14 +1,18 @@
 //! `repoplane-worker`: a Temporal activity worker for the forge activities, on one queue. It
-//! holds the forge tokens (read from the variables each connection names), and talks only to
-//! Temporal and to forges: no database, no repoplane API, no inbound connection (ADR 0001).
+//! holds the forge tokens and chooses one for each connection by where its forge is (ADR 0014),
+//! and talks only to Temporal and to forges: no database, no repoplane API, no inbound
+//! connection (ADR 0001).
 
 #[cfg(test)]
 mod fake;
 // The activity macro also generates call markers for workflows, which this binary never names.
 #[allow(dead_code)]
 mod forge;
+mod tokens;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Parser;
@@ -30,6 +34,9 @@ struct Cli {
     /// Overrides `temporal.address`.
     #[arg(long)]
     temporal_address: Option<String>,
+    /// Adds to `tokens`, or overrides the same key there. Repeatable.
+    #[arg(long = "token", value_name = "WHERE=VARIABLE")]
+    tokens: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -57,6 +64,12 @@ struct Config {
     concurrency: usize,
     #[serde(default)]
     temporal: TemporalConfig,
+    /// The forge tokens this worker holds, by where each may be sent (`host`, `host:port`,
+    /// `host/org` or `host:port/org`), each naming the variable that holds it. A connection gets
+    /// the closest match, or fails at once when there is none: it carries no credential of its
+    /// own (ADR 0014). Required: a worker without a token can serve nothing.
+    #[serde(default)]
+    tokens: BTreeMap<String, String>,
 }
 
 fn default_queue() -> String {
@@ -82,6 +95,12 @@ fn load(cli: &Cli) -> anyhow::Result<Config> {
     if let Some(a) = &cli.temporal_address {
         cfg.temporal.address = a.clone();
     }
+    for t in &cli.tokens {
+        let Some((at, var)) = t.split_once('=') else {
+            bail!("--token {t:?}: want WHERE=VARIABLE, as in github.com=GITHUB_TOKEN");
+        };
+        cfg.tokens.insert(at.to_string(), var.to_string());
+    }
     if cfg.concurrency == 0 {
         bail!("concurrency must be at least 1");
     }
@@ -99,6 +118,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     let cfg = load(&cli)?;
+    let tokens = tokens::Tokens::load(&cfg.tokens, cfg.temporal.api_key_env.as_deref(), |v| {
+        std::env::var(v).ok()
+    })?;
+    let token_keys = tokens.keys();
     let identity = format!(
         "repoplane-worker@{}",
         std::env::var("HOSTNAME").unwrap_or_else(|_| std::process::id().to_string())
@@ -118,13 +141,14 @@ async fn main() -> anyhow::Result<()> {
         WorkerOptions::new(cfg.queue.clone())
             .register_activities(forge::ForgeActivities {
                 transport: ReqwestTransport::new()?,
+                tokens: Arc::new(tokens),
             })
             .tuner(tuner)
             .build(),
     )
     .map_err(|e| anyhow::anyhow!("temporal worker: {e}"))?;
     let stop = worker.shutdown_handle();
-    tracing::info!(queue = %cfg.queue, temporal = %cfg.temporal.address, concurrency = cfg.concurrency, "worker started");
+    tracing::info!(queue = %cfg.queue, temporal = %cfg.temporal.address, concurrency = cfg.concurrency, tokens = ?token_keys, "worker started");
     let (_, ran) = tokio::join!(
         async {
             shutdown().await;
@@ -152,8 +176,8 @@ async fn shutdown() {
 mod tests {
     use super::*;
 
-    /// The example operators copy shows the defaults: it must stay true, and the key it shows
-    /// commented out must still be one the file accepts.
+    /// The example operators copy shows the defaults: it must stay true, and the keys it shows
+    /// commented out must still be ones the file accepts.
     #[test]
     fn the_example_is_the_defaults() {
         let example = include_str!("../../../examples/repoplane-worker.yaml");
@@ -170,5 +194,16 @@ mod tests {
             Some("TEMPORAL_API_KEY")
         );
         cloud.temporal.validate().unwrap();
+
+        let held: Config = serde_yaml_ng::from_str(
+            &example
+                .replace("# tokens:", "tokens:")
+                .replace("#   ", "  "),
+        )
+        .unwrap();
+        assert_eq!(held.tokens.len(), 4);
+        let tokens =
+            tokens::Tokens::load(&held.tokens, None, |v| Some(format!("value-of-{v}"))).unwrap();
+        assert_eq!(tokens.keys().len(), 4);
     }
 }

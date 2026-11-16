@@ -65,7 +65,6 @@ async fn connection(store: &Store, queue: &str) -> Connection {
             org: queue.into(),
             base_url: Some("http://forgejo.test".into()),
             auth: AuthMode::Token,
-            token_env: "TOKEN".into(),
             queue: Some(queue.into()),
         })
         .await

@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 
-use repoplane_forge::{ReqwestTransport, lister};
+use repoplane_forge::{ReqwestTransport, Token, lister};
 use repoplane_proto::id::ConnectionId;
 use repoplane_proto::inventory::ConnectionSpec;
 use tokio_util::sync::CancellationToken;
@@ -25,10 +25,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         forge: forge.parse()?,
         org: org.clone(),
         base_url: base_url.trim_end_matches('/').to_string(),
-        token_env: token_env.clone(),
         queue: "default".into(),
     };
-    let l = lister(&spec, ReqwestTransport::new()?, CancellationToken::new())?;
+    let l = lister(
+        &spec,
+        Token::from_env(token_env)?,
+        ReqwestTransport::new()?,
+        CancellationToken::new(),
+    )?;
     let started = std::time::Instant::now();
     let (mut cursor, mut pages, mut total) = (None::<String>, 0, 0);
     let mut ids = HashSet::new();

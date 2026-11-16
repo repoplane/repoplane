@@ -240,14 +240,14 @@ async fn request_reconcile(
     Ok((StatusCode::CREATED, Json(r)))
 }
 
-/// What a workflow needs to reach the connection's forge: everything but the secret.
+/// What a workflow needs to reach the connection's forge: everything but the token, which the
+/// worker holds and chooses (ADR 0014).
 fn spec(c: &Connection) -> ConnectionSpec {
     ConnectionSpec {
         id: c.id,
         forge: c.forge,
         org: c.org.clone(),
         base_url: c.base_url.clone(),
-        token_env: c.token_env.clone(),
         queue: c.queue.clone(),
     }
 }

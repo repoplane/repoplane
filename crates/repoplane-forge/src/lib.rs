@@ -86,18 +86,9 @@ pub fn numeric_id(forge: &'static str, id: &str) -> Result<u64, ForgeError> {
         .map_err(|_| ForgeError::protocol(forge, format!("{id:?} is not a repository id")))
 }
 
-/// The adapter for a connection. The token is read here, in the worker, from the variable the
-/// connection names; it is never sent anywhere but to the forge.
+/// The adapter for a connection, with the token the worker chose for it: a connection carries
+/// none. The token is never sent anywhere but to the forge.
 pub fn lister(
-    spec: &ConnectionSpec,
-    transport: Arc<dyn Transport>,
-    cancel: CancellationToken,
-) -> Result<Box<dyn Lister>, ForgeError> {
-    let token = Token::from_env(&spec.token_env)?;
-    lister_with_token(spec, token, transport, cancel)
-}
-
-pub fn lister_with_token(
     spec: &ConnectionSpec,
     token: Token,
     transport: Arc<dyn Transport>,

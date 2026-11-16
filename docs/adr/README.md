@@ -14,3 +14,4 @@ Each record is a decision in force. Numbers are never reused, so a withdrawn rec
 - [11. Inventory and HEADs are separate operations](0011-inventory-and-heads-are-separate.md)
 - [12. Temporal orchestrates; Postgres is product state](0012-temporal-orchestrates.md)
 - [13. `connection sync` composes the runs; fan-out stays within Temporal's limits](0013-sync-and-fan-out-within-temporal-limits.md)
+- [14. The worker chooses each connection's token](0014-the-worker-chooses-each-connections-token.md)
