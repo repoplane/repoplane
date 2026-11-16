@@ -239,6 +239,10 @@ Secrets are named, never written:
 No flag takes a secret, and a value that looks like one is refused where a variable name is
 expected.
 
+The connection to Temporal uses TLS when its address is `https://`, verified against the system's
+trusted roots (`SSL_CERT_FILE` or `SSL_CERT_DIR` replace them, for a private CA). A Temporal API key
+is refused over `http://` unless the address is loopback, such as a TLS-terminating sidecar's.
+
 ## Testing
 
 - **Unit (`make unit`):** the four adapters against scripted HTTP; the worker's activities; the
