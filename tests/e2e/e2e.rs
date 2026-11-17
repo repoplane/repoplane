@@ -397,11 +397,19 @@ async fn selectors(s: &Suite) -> anyhow::Result<()> {
             .map(|(full, _)| full.clone())
             .collect()
     };
-    let listed = async |select: &[&str]| -> anyhow::Result<BTreeSet<String>> {
+    // A cloud sandbox's organisation holds repositories no fleet declares (a suffix `*pi`
+    // selected 179 on gh against the 14 the locks name), so what is checked is the declared
+    // ones: the others have no expected answer.
+    let listed_all = async |select: &[&str]| -> anyhow::Result<BTreeSet<String>> {
         let mut args = vec!["repo", "list", "--connection", s.connection.as_str()];
         args.extend(select);
         let repos: Vec<repoplane_proto::api::Repository> = s.stack.cli_json(&args).await?;
         Ok(repos.into_iter().map(|r| r.full_name).collect())
+    };
+    let listed = async |select: &[&str]| -> anyhow::Result<BTreeSet<String>> {
+        let mut all = listed_all(select).await?;
+        all.retain(|n| exp.contains_key(n));
+        Ok(all)
     };
     let check = |what: &str, got: BTreeSet<String>, want: BTreeSet<String>| {
         anyhow::ensure!(got == want, "{what}: listed {got:?}, want {want:?}");
@@ -465,10 +473,11 @@ async fn selectors(s: &Suite) -> anyhow::Result<()> {
         .stack
         .refresh_heads(&s.connection, &["--name", &name])
         .await?;
-    let exact = want(&|n, _| n == name).len() as i64;
+    // What the same selector lists, undeclared repositories included.
+    let exact = listed_all(&["--name", &name]).await?.len() as i64;
     anyhow::ensure!(
-        h.targeted == exact,
-        "a refresh of {name:?} targeted {}, want {exact}",
+        exact > 0 && h.targeted == exact,
+        "a refresh of {name:?} targeted {}, the listing has {exact}",
         h.targeted
     );
 
@@ -511,7 +520,8 @@ async fn selectors(s: &Suite) -> anyhow::Result<()> {
     } else {
         // Without a connection named the listing is not refused: it counts what the forge
         // cannot say, with the reason, and a name that rules a repository out is not counted.
-        let all = s.stack.api_get("/v1/repositories").await?;
+        let all = s.stack.api_get("/v1/repositories?limit=1000").await?;
+        anyhow::ensure!(all["next_cursor"].is_null(), "more than 1000 repositories");
         let active = all["items"].as_array().map_or(0, |i| i.len());
         let v = s.stack.api_get("/v1/repositories?topic=node").await?;
         anyhow::ensure!(
