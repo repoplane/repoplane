@@ -126,7 +126,10 @@ async fn inventory() {
     ];
     for (name, mutates, scenario) in scenarios {
         eprintln!("--- {name}");
+        let started = std::time::Instant::now();
         let res = scenario.await;
+        let ran = started.elapsed();
+        let reset = std::time::Instant::now();
         if mutates {
             // Put the forge back, then bring the inventory back with it: the next scenario
             // starts from the locks on both sides, and a reconcile after a reset is itself
@@ -139,10 +142,12 @@ async fn inventory() {
                 ));
             }
         }
+        // How long it ran, and how long putting the sandbox back took: a slow job says where.
+        let timing = format!("ran {ran:.1?}, reset {:.1?}", reset.elapsed());
         match res {
-            Ok(()) => eprintln!("ok: {name}"),
+            Ok(()) => eprintln!("ok: {name} ({timing})"),
             Err(e) => {
-                eprintln!("FAILED: {name}: {e:#}");
+                eprintln!("FAILED: {name} ({timing}): {e:#}");
                 failures.push(format!("{name}: {e:#}"));
             }
         }
