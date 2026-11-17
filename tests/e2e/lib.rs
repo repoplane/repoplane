@@ -742,6 +742,20 @@ impl Stack {
         serde_json::from_str(&raw).with_context(|| format!("decode: {raw}"))
     }
 
+    /// A GET on the API, for what the CLI does not print (its stderr notes, its JSON being
+    /// only the items).
+    pub async fn api_get(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let resp = reqwest::Client::new()
+            .get(format!("{}{path}", self.api_url))
+            .bearer_auth(&self.api_token)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        anyhow::ensure!(status.is_success(), "GET {path}: {status} {body}");
+        serde_json::from_str(&body).with_context(|| format!("decode: {body}"))
+    }
+
     pub async fn reconcile(&self, connection: &str) -> anyhow::Result<Reconcile> {
         self.cli_json(&[
             "connection",
