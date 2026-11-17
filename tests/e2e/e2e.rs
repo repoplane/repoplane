@@ -6,7 +6,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use forgelab::forge::Settings;
-use repoplane_e2e::{ForgeProxy, ForgeSide, Stack, compare, expected, sandbox};
+use repoplane_e2e::{
+    ForgeProxy, ForgeSide, Stack, compare, expected, note, sandbox, workspace_root,
+};
 use repoplane_proto::ForgeKind;
 use repoplane_proto::api::{HeadRefresh, RepositoryStatus};
 
@@ -21,6 +23,8 @@ struct Suite {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inventory() {
     let Some(sb) = sandbox() else { return };
+    // A run's scenarios, not those of the runs before it on this machine.
+    let _ = std::fs::remove_file(workspace_root().join("target/e2e-logs/scenarios.log"));
     let side = ForgeSide::start(&sb).await.expect("start the forge side");
     side.prepare().await.expect("prepare the sandbox");
     let stack = Stack::start(side.worker_token().expect("the worker's token"))
@@ -128,8 +132,9 @@ async fn inventory() {
             Box::pin(deleted(&s)),
         ),
     ];
+    let (total, suite_started) = (scenarios.len(), std::time::Instant::now());
     for (name, mutates, scenario) in scenarios {
-        eprintln!("--- {name}");
+        note(format!("--- {name}"));
         let started = std::time::Instant::now();
         let res = scenario.await;
         let ran = started.elapsed();
@@ -149,13 +154,19 @@ async fn inventory() {
         // How long it ran, and how long putting the sandbox back took: a slow job says where.
         let timing = format!("ran {ran:.1?}, reset {:.1?}", reset.elapsed());
         match res {
-            Ok(()) => eprintln!("ok: {name} ({timing})"),
+            Ok(()) => note(format!("ok: {name} ({timing})")),
             Err(e) => {
-                eprintln!("FAILED: {name} ({timing}): {e:#}");
+                note(format!("FAILED: {name} ({timing}): {e:#}"));
                 failures.push(format!("{name}: {e:#}"));
             }
         }
     }
+    note(format!(
+        "{} scenarios, {} failed, {:.0?} in all",
+        total,
+        failures.len(),
+        suite_started.elapsed()
+    ));
     assert!(
         failures.is_empty(),
         "{} scenario(s) failed:\n{}",

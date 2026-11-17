@@ -36,6 +36,23 @@ pub fn workspace_root() -> PathBuf {
 
 /// Which sandbox to run against, from `REPOPLANE_E2E_SANDBOX`. Unset means the suite is skipped:
 /// it needs Docker, and for the cloud sandboxes, tokens.
+/// Says how a scenario went: on stderr, and in `target/e2e-logs/scenarios.log`, which CI uploads
+/// with the API's and the worker's logs. A job's own log has lost its tail before, and the
+/// scenarios' timings are what says where a slow run went.
+pub fn note(line: impl std::fmt::Display) {
+    use std::io::Write as _;
+    eprintln!("{line}");
+    let dir = workspace_root().join("target/e2e-logs");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("scenarios.log"))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 pub fn sandbox() -> Option<String> {
     match std::env::var("REPOPLANE_E2E_SANDBOX") {
         Ok(s) if !s.is_empty() => Some(s),
