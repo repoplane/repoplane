@@ -17,4 +17,5 @@ activities run in a worker, never calling the forge back.
 ## Consequences
 
 All forge I/O stays in the worker, which is what the audit is about. `make boundaries` fails
-the build if `repoplane-api` links `repoplane-forge` or an HTTP client.
+the build if `repoplane-api` links `repoplane-forge` or `reqwest`, the workspace's HTTP client.
+The check names that one crate: axum brings `hyper` in, so no broader ban is possible.

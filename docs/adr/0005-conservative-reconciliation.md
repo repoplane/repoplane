@@ -14,6 +14,10 @@ stamped with it. Only a workflow that read every page, and looked up every repos
 older rows inaccessible. A failed or interrupted run marks nothing. Rows are never deleted. An
 older run can never overwrite a row a newer one wrote.
 
+A connection has at most one reconcile in flight: a second request joins it rather than
+starting another (a unique index on `reconciles`, `0001_inventory.sql`). Two runs listing at
+once could not both hold the watermark that decides what is inaccessible.
+
 ## Consequences
 
 A complete listing is still not proof of absence. On forges paged by offset (Forgejo, GitHub,
