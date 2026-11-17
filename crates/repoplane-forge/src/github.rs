@@ -132,7 +132,9 @@ impl Repo {
                 name: self.name,
                 default_branch: self.default_branch.filter(|b| !b.is_empty()),
                 archived: self.archived,
-                topics: Some(self.topics.unwrap_or_default()),
+                // A payload without `topics` is a forge that did not say, not a repository with none
+                // (ADR 0009): null, so a topic selector counts it as unknown.
+                topics: self.topics,
                 locator,
                 empty,
                 web_url: self.html_url,
@@ -297,6 +299,23 @@ fn until_reset(resp: &Response<Bytes>) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0009: a payload that does not say `topics` is unknown (null); only `[]` is "none".
+    #[test]
+    fn missing_topics_are_unknown_not_none() {
+        let topics = |json: &str| {
+            let r: Repo = serde_json::from_str(json).unwrap();
+            r.into_listed().snapshot.topics
+        };
+        assert_eq!(
+            topics(r#"{"id": 1, "full_name": "acme/a", "name": "a"}"#),
+            None
+        );
+        assert_eq!(
+            topics(r#"{"id": 1, "full_name": "acme/a", "name": "a", "topics": []}"#),
+            Some(vec![])
+        );
+    }
     use crate::http::ScriptedTransport;
 
     fn repo(id: i64, name: &str) -> serde_json::Value {
