@@ -206,15 +206,23 @@ pub fn head_refresh(connection: &str, r: &HeadRefresh) -> String {
     for (k, v) in n {
         out.push_str(&format!("{k:<13}{v:>w$}\n"));
     }
-    if !r.unread_repositories.is_empty() {
-        out.push('\n');
-        for u in &r.unread_repositories {
-            out.push_str(&format!("unread  {}  {}\n", u.full_name, u.reason));
-        }
-        let more = r.unread - r.unread_repositories.len() as i64;
-        if more > 0 {
-            out.push_str(&format!("unread  … and {more} more\n"));
-        }
+    out.push_str(&unread_lines(r));
+    out
+}
+
+/// The repositories a refresh could not read, each with the forge's reason, after a blank line;
+/// nothing when it read them all.
+fn unread_lines(r: &HeadRefresh) -> String {
+    if r.unread_repositories.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n");
+    for u in &r.unread_repositories {
+        out.push_str(&format!("unread  {}  {}\n", u.full_name, u.reason));
+    }
+    let more = r.unread - r.unread_repositories.len() as i64;
+    if more > 0 {
+        out.push_str(&format!("unread  … and {more} more\n"));
     }
     out
 }
@@ -259,7 +267,7 @@ pub fn sync(r: &Sync) -> String {
         None => out.push_str(&format!("{:<12}{ABSENT}\n", "Refresh")),
     }
     let h = r.head_refresh.as_ref();
-    let rows = [
+    let mut rows = vec![
         ("Discovered", Some(r.reconcile.discovered)),
         ("Recorded", Some(r.reconcile.recorded)),
         ("Inaccessible", Some(r.reconcile.inaccessible)),
@@ -267,6 +275,10 @@ pub fn sync(r: &Sync) -> String {
         ("Observed", h.map(|h| h.observed)),
         ("Changed", h.map(|h| h.changed)),
     ];
+    // Only when there is one, as in `head_refresh`: a sync that read everything looks as before.
+    if let Some(h) = h.filter(|h| h.unread > 0) {
+        rows.push(("Unread", Some(h.unread)));
+    }
     let w = rows
         .iter()
         .map(|(_, v)| v.map_or(1, |v| v.to_string().len()))
@@ -277,6 +289,9 @@ pub fn sync(r: &Sync) -> String {
     for (k, v) in rows {
         let v = v.map_or(ABSENT.to_string(), |v| v.to_string());
         out.push_str(&format!("{k:<13}{v:>w$}\n"));
+    }
+    if let Some(h) = h {
+        out.push_str(&unread_lines(h));
     }
     out
 }
@@ -372,11 +387,11 @@ mod tests {
         assert!(out.lines().nth(1).unwrap().contains("—"), "{out}");
     }
 
-    #[test]
-    fn sync_matches_the_readme() {
+    /// The sync the README shows: everything read.
+    fn a_sync() -> Sync {
         let now = Utc::now();
         let connection_id = ConnectionId::new();
-        let r = Sync {
+        Sync {
             id: "syn_06G9N0B1C2D3E4F5G6H7J8K9MN".parse().unwrap(),
             connection_id,
             status: RunStatus::Succeeded,
@@ -410,7 +425,12 @@ mod tests {
             requested_at: now,
             started_at: None,
             finished_at: None,
-        };
+        }
+    }
+
+    #[test]
+    fn sync_matches_the_readme() {
+        let r = a_sync();
         let readme =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
                 .unwrap();
@@ -450,5 +470,27 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("… and 1 more"), "{out}");
+    }
+
+    /// `connection sync` says what its head refresh could not read, as `refresh-heads` does, and
+    /// stays as the README shows it when everything was read.
+    #[test]
+    fn a_sync_names_what_it_could_not_read() {
+        let mut r = a_sync();
+        assert!(!sync(&r).contains("nread"), "{}", sync(&r));
+        let h = r.head_refresh.as_mut().unwrap();
+        h.observed = 5;
+        h.unread = 1;
+        h.unread_repositories = vec![repoplane_proto::api::UnreadRepository {
+            full_name: "acme/secret".into(),
+            reason: "git ls-remote: 403".into(),
+        }];
+        let out = sync(&r);
+        assert!(out.contains("Unread"), "{out}");
+        assert!(
+            out.contains("unread  acme/secret  git ls-remote: 403"),
+            "{out}"
+        );
+        assert!(!out.contains("more"), "{out}");
     }
 }
