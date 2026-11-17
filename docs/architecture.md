@@ -108,11 +108,10 @@ to child workflows of at most 1,000 each (ADR 0013). This was measured: 2,139 HE
 scheduled in one workflow stalled it. A child's history is about 4,000 events per 1,000
 repositories, well under Temporal's 51,200.
 
-Forge steps retry 8 times, backing off from 1s to 60s. A forge that says it is rate limiting
-(a 429 over its API or over git) is retried after the wait it asked for, or a minute when it
-does not say, for up to 30 attempts: retrying within seconds lands in the same window and only
-spends the quota again. The rule is the same on every forge; only a forge that rate limits
-waits. A failure the worker marks non-retryable (a refused token, a forge the worker holds no
+Forge steps retry up to 30 times, backing off from 1s to 60s; Temporal's retry policy is the
+only rule, the same on every forge. A forge that says it is rate limiting (a 429 over its API
+or over git) is retried after the wait it asked for, or a minute when it does not say:
+retrying within seconds lands in the same window and only spends the quota again. A failure the worker marks non-retryable (a refused token, a forge the worker holds no
 token for, a protocol violation) fails the run at once. The run's record then says why, from
 the forge's own message.
 
