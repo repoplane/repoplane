@@ -47,6 +47,10 @@ REPOSITORY                    BRANCH   ARCHIVED   HEAD       TOPICS
 acme-services/billing-api     main     false      22d00302   node service sonar
 acme-services/ledger-worker   main     false      1833865b   node service
 acme-services/node-gateway    main     false      568a26e9   gateway node service
+
+$ repoplane repo list --name 'ledger-*'
+REPOSITORY                    BRANCH   ARCHIVED   HEAD       TOPICS
+acme-services/ledger-worker   main     false      1833865b   node service
 ```
 
 `connection sync` is the everyday command: a reconcile, then a head refresh of every repository
