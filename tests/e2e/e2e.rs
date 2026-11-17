@@ -56,6 +56,10 @@ async fn inventory() {
         connection,
     };
     let mut failures = Vec::new();
+    // These scenarios change the forge only on the local sandbox, and skip themselves on the
+    // others: putting a cloud sandbox back and resyncing after a scenario that did nothing took
+    // minutes (gl: 7 of its 29).
+    let local = s.side.sandbox == "local";
     let scenarios: Vec<(&str, bool, Scenario)> = vec![
         ("baseline", false, Box::pin(baseline(&s))),
         ("idempotent", false, Box::pin(idempotent(&s))),
@@ -82,7 +86,7 @@ async fn inventory() {
         ),
         (
             "a repository skipped by a shifting listing stays active",
-            true,
+            local,
             Box::pin(shifting_listing(&s)),
         ),
         (
@@ -92,7 +96,7 @@ async fn inventory() {
         ),
         (
             "a rate-limited forge call waits as long as the forge asked",
-            true,
+            local,
             Box::pin(rate_limited(&s)),
         ),
         (
@@ -120,7 +124,7 @@ async fn inventory() {
         ),
         (
             "deleted repo goes inaccessible",
-            true,
+            local,
             Box::pin(deleted(&s)),
         ),
     ];
