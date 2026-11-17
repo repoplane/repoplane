@@ -43,6 +43,13 @@ jobs:
       - run: make ci
         env:
           REPOPLANE_FLEETS_DIR: ${{ github.workspace }}/fleets
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs-local
+          path: target/e2e-logs
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The same suite on the real sandboxes: nightly, or on demand. They take 15 to 30 minutes
   # (gitlab.com Free's rate limit alone is most of gl's), so no pull request or push waits for
@@ -79,3 +86,11 @@ jobs:
           FORGELAB_GH_TOKEN: ${{ secrets.FORGELAB_GH_TOKEN }}
           FORGELAB_GL_TOKEN: ${{ secrets.FORGELAB_GL_TOKEN }}
           FORGELAB_ADO_TOKEN: ${{ secrets.FORGELAB_ADO_TOKEN }}
+      # The API's and the worker's logs, to read what a slow or failed run was doing.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs-${{ matrix.sandbox }}
+          path: target/e2e-logs
+          if-no-files-found: ignore
+          retention-days: 7
