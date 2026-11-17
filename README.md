@@ -47,6 +47,10 @@ REPOSITORY                    BRANCH   ARCHIVED   HEAD       TOPICS
 acme-services/billing-api     main     false      22d00302   node service sonar
 acme-services/ledger-worker   main     false      1833865b   node service
 acme-services/node-gateway    main     false      568a26e9   gateway node service
+
+$ repoplane repo list --name 'ledger-*'
+REPOSITORY                    BRANCH   ARCHIVED   HEAD       TOPICS
+acme-services/ledger-worker   main     false      1833865b   node service
 ```
 
 `connection sync` is the everyday command: a reconcile, then a head refresh of every repository
@@ -58,9 +62,16 @@ it left active, as one run. Each step is also a command of its own:
   gone); those repositories are marked, never deleted. It reads no HEAD, so it costs one to three
   requests per organisation on GitHub, GitLab and Azure DevOps.
 - **`repo refresh-heads`** reads *what each repository's default branch points at*, for a
-  connection's repositories or only those a filter selects. A scan of the `node` repositories
+  connection's repositories or only those a selector selects. A scan of the `node` repositories
   reads their HEADs, not the organisation's. *Changed* counts HEADs that moved. `repo list`
   shows the last HEAD observed, or `—` until one has been.
+
+**Selectors** choose repositories from the inventory, for `repo list` and `repo refresh-heads`
+(and later for check rules): `--topic node` (repeat for any of several), `--name '*-starter'`
+(the last path segment, `*` for any characters, no `/`) and `--archived false`, combined with
+AND. A forge that cannot answer, such as Azure DevOps for a topic, leaves a repository neither
+selected nor ruled out, and `repo list` says how many it left out and why
+([ADR 0015](docs/adr/0015-selectors-choose-repositories-from-the-inventory.md)).
 
 ## How it is built
 

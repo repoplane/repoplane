@@ -148,15 +148,73 @@ pub struct RepositoryList {
     pub items: Vec<Repository>,
     /// Pass back as `cursor` for the next page; absent on the last one.
     pub next_cursor: Option<String>,
+    /// On the first page: what the selector could not decide, per connection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unselected: Vec<Unselected>,
 }
 
-/// Which repositories of a connection a head refresh reads. Empty means all of them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RefreshHeads {
+/// Which repositories an operation acts on (ADR 0015): what the inventory records about them,
+/// never their contents. Every field is optional and they combine with AND; empty selects all.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Selector {
+    /// Repositories with any of these topics. A forge without topics cannot answer: those
+    /// repositories are unknown, neither selected nor ruled out.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many"
+    )]
+    pub topic: Vec<String>,
+    /// The repository's last path segment, case-insensitively, `*` standing for any run of
+    /// characters: `*-starter`, `s4a-roma-*-starter`. No `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub topic: Option<String>,
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+}
+
+impl Selector {
+    pub fn is_empty(&self) -> bool {
+        *self == Selector::default()
+    }
+
+    /// Refuses what no repository could match, so a typo is an error rather than an empty answer.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.topic.iter().any(|t| t.trim().is_empty()) {
+            return Err("a topic must not be empty".into());
+        }
+        match self.name.as_deref() {
+            Some("") => Err("a name pattern must not be empty".into()),
+            Some(n) if n.contains('/') => Err(format!(
+                "name {n:?} contains '/': a name pattern matches a repository's last segment, \
+                 so use `*-starter`, not `acme/*-starter`; a connection is already one organisation"
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A string or a list of strings, so `"topic": "node"` and `"topic": ["node", "go"]` both read.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+/// Repositories a listing left out because the forge cannot say whether they match: the
+/// selector asked for a topic and the forge has none. Neither selected nor ruled out.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Unselected {
+    pub connection: String,
+    pub count: i64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -213,4 +271,39 @@ pub struct Sync {
 pub struct ErrorBody {
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn a_topic_is_one_or_a_list() {
+        let one: Selector = serde_json::from_str(r#"{"topic": "node"}"#).unwrap();
+        let many: Selector = serde_json::from_str(r#"{"topic": ["node", "go"]}"#).unwrap();
+        assert_eq!(one.topic, ["node"]);
+        assert_eq!(many.topic, ["node", "go"]);
+        // An empty body selects everything, and writes back as an empty object.
+        let all: Selector = serde_json::from_str("{}").unwrap();
+        assert!(all.is_empty());
+        assert_eq!(serde_json::to_string(&all).unwrap(), "{}");
+    }
+
+    #[test]
+    fn what_no_repository_could_match_is_refused() {
+        let named = |n: &str| Selector {
+            name: Some(n.into()),
+            ..Selector::default()
+        };
+        assert!(named("*-starter").validate().is_ok());
+        assert!(named("s4a-roma-*-starter").validate().is_ok());
+        let slash = named("acme/*-starter").validate().unwrap_err();
+        assert!(slash.contains("last segment"), "{slash}");
+        assert!(named("").validate().is_err());
+        let blank_topic = Selector {
+            topic: vec![" ".into()],
+            ..Selector::default()
+        };
+        assert!(blank_topic.validate().is_err());
+    }
 }

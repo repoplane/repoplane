@@ -3,7 +3,7 @@
 //! safe to repeat, like every run step.
 
 use chrono::{DateTime, Utc};
-use repoplane_proto::api::{Connection, RefreshHeads, Sync};
+use repoplane_proto::api::{Connection, Selector, Sync};
 use repoplane_proto::id::{ConnectionId, HeadRefreshId, ReconcileId, SyncId};
 use repoplane_proto::inventory::SyncHeads;
 use uuid::Uuid;
@@ -108,7 +108,7 @@ impl Store {
                     .connection(&ConnectionId::from_uuid(connection_id).to_string())
                     .await?;
                 let r = self
-                    .request_head_refresh(&connection, &RefreshHeads::default())
+                    .request_head_refresh(&connection, &Selector::default())
                     .await?;
                 sqlx::query(
                     "update syncs set head_refresh_id = $2 where id = $1 and head_refresh_id is null",

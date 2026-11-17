@@ -79,6 +79,11 @@ async fn inventory() {
             Box::pin(refresh_targets(&s)),
         ),
         (
+            "selectors choose what the fleets say",
+            false,
+            Box::pin(selectors(&s)),
+        ),
+        (
             "sync reconciles, then reads every HEAD",
             false,
             Box::pin(sync(&s)),
@@ -375,6 +380,159 @@ async fn table_output(s: &Suite) -> anyhow::Result<()> {
     let cols: Vec<&str> = line.split_whitespace().collect();
     anyhow::ensure!(cols[1..4] == ["main", "false", "b8a1a303"], "{line}");
     anyhow::ensure!(cols[4..] == ["node", "service"], "{line}");
+    Ok(())
+}
+
+/// ADR 0015. Each selector is checked against the fleets' locks, read here with plain string
+/// comparisons, so the answer does not come from the code under test: names by prefix, suffix,
+/// exactly and in capitals, with topics and archived, and what a forge without topics cannot say.
+async fn selectors(s: &Suite) -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+    let caps = s.side.forge.caps();
+    let exp = expected(&s.side)?;
+    let last = |full: &str| full.rsplit('/').next().unwrap_or(full).to_lowercase();
+    let want = |pick: &dyn Fn(&str, &repoplane_e2e::Expected) -> bool| -> BTreeSet<String> {
+        exp.iter()
+            .filter(|(full, e)| pick(&last(full), e))
+            .map(|(full, _)| full.clone())
+            .collect()
+    };
+    let listed = async |select: &[&str]| -> anyhow::Result<BTreeSet<String>> {
+        let mut args = vec!["repo", "list", "--connection", s.connection.as_str()];
+        args.extend(select);
+        let repos: Vec<repoplane_proto::api::Repository> = s.stack.cli_json(&args).await?;
+        Ok(repos.into_iter().map(|r| r.full_name).collect())
+    };
+    let check = |what: &str, got: BTreeSet<String>, want: BTreeSet<String>| {
+        anyhow::ensure!(got == want, "{what}: listed {got:?}, want {want:?}");
+        anyhow::Ok(())
+    };
+
+    // Names to choose by, taken from the fleets: the first repository's.
+    let name = exp
+        .keys()
+        .next()
+        .map(|full| last(full))
+        .ok_or_else(|| anyhow::anyhow!("the fleets declare no repository"))?;
+    anyhow::ensure!(name.len() >= 3 && name.is_ascii(), "name {name:?}");
+    let (head, tail) = (&name[..2], &name[name.len() - 2..]);
+
+    let prefix = format!("{head}*");
+    let got = listed(&["--name", &prefix]).await?;
+    anyhow::ensure!(!got.is_empty(), "{prefix} selected nothing");
+    check("a prefix", got, want(&|n, _| n.starts_with(head)))?;
+    let capitals = prefix.to_uppercase();
+    check(
+        "a prefix in capitals",
+        listed(&["--name", &capitals]).await?,
+        want(&|n, _| n.starts_with(head)),
+    )?;
+    let suffix = format!("*{tail}");
+    check(
+        "a suffix",
+        listed(&["--name", &suffix]).await?,
+        want(&|n, _| n.ends_with(tail)),
+    )?;
+    check(
+        "a whole name",
+        listed(&["--name", &name]).await?,
+        want(&|n, _| n == name),
+    )?;
+    check(
+        "a name nothing has",
+        listed(&["--name", "zzz-no-such-*"]).await?,
+        BTreeSet::new(),
+    )?;
+    for archived in [false, true] {
+        let flag = archived.to_string();
+        check(
+            "a prefix and archived",
+            listed(&["--name", &prefix, "--archived", &flag]).await?,
+            want(&|n, e| n.starts_with(head) && e.archived == archived),
+        )?;
+    }
+
+    // A '/' is refused, naming why, rather than matching nothing.
+    let err = s
+        .stack
+        .cli(&["repo", "list", "--name", "acme/*-starter"])
+        .await
+        .expect_err("a name with a '/' must be refused");
+    anyhow::ensure!(err.to_string().contains("last segment"), "{err}");
+
+    // A head refresh takes the same selector: one repository's HEAD, not the organisation's.
+    let h = s
+        .stack
+        .refresh_heads(&s.connection, &["--name", &name])
+        .await?;
+    let exact = want(&|n, _| n == name).len() as i64;
+    anyhow::ensure!(
+        h.targeted == exact,
+        "a refresh of {name:?} targeted {}, want {exact}",
+        h.targeted
+    );
+
+    if caps.topics {
+        let topics: Vec<&String> = exp
+            .values()
+            .filter_map(|e| e.topics.as_ref())
+            .flatten()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        anyhow::ensure!(topics.len() >= 2, "the fleets use fewer than two topics");
+        let (a, b) = (topics[0].as_str(), topics[1].as_str());
+        let has = |e: &repoplane_e2e::Expected, t: &str| {
+            e.topics
+                .as_ref()
+                .is_some_and(|ts| ts.iter().any(|x| x == t))
+        };
+        check(
+            "a topic",
+            listed(&["--topic", a]).await?,
+            want(&|_, e| has(e, a)),
+        )?;
+        check(
+            "any of two topics",
+            listed(&["--topic", a, "--topic", b]).await?,
+            want(&|_, e| has(e, a) || has(e, b)),
+        )?;
+        check(
+            "a topic and a name",
+            listed(&["--topic", a, "--name", &prefix]).await?,
+            want(&|n, e| has(e, a) && n.starts_with(head)),
+        )?;
+        // Nothing is left out as unknown where every forge has topics.
+        let v = s
+            .stack
+            .api_get(&format!("/v1/repositories?topic={a}"))
+            .await?;
+        anyhow::ensure!(v.get("unselected").is_none(), "unselected: {v}");
+    } else {
+        // Without a connection named the listing is not refused: it counts what the forge
+        // cannot say, with the reason, and a name that rules a repository out is not counted.
+        let all = s.stack.api_get("/v1/repositories").await?;
+        let active = all["items"].as_array().map_or(0, |i| i.len());
+        let v = s.stack.api_get("/v1/repositories?topic=node").await?;
+        anyhow::ensure!(
+            v["items"].as_array().is_some_and(|i| i.is_empty()),
+            "a topic on a forge without topics listed {v}"
+        );
+        let u = &v["unselected"][0];
+        anyhow::ensure!(
+            u["connection"] == s.connection.as_str()
+                && u["count"] == active
+                && u["reason"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("no repository topics")),
+            "unselected: {v}"
+        );
+        let v = s
+            .stack
+            .api_get("/v1/repositories?topic=node&name=zzz-no-such-*")
+            .await?;
+        anyhow::ensure!(v.get("unselected").is_none(), "ruled out by name: {v}");
+    }
     Ok(())
 }
 

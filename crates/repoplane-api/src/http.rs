@@ -18,8 +18,8 @@ use repoplane_flow::{
 };
 use repoplane_proto::api::{Connection, ConnectionCheck, RunStatus};
 use repoplane_proto::api::{
-    ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
-    RepositoryList, Sync,
+    ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RepositoryList, Selector,
+    Sync,
 };
 use repoplane_proto::id::{ConnectionId, HeadRefreshId, ReconcileId, SyncId};
 use repoplane_proto::inventory::ConnectionSpec;
@@ -575,7 +575,7 @@ async fn request_head_refresh(
     State(s): State<AppState>,
     h: HeaderMap,
     Path(key): Path<String>,
-    body: Option<Json<RefreshHeads>>,
+    body: Option<Json<Selector>>,
 ) -> ApiResult<impl IntoResponse> {
     authorized(&s, &h)?;
     let c = s.store.connection(&key).await?;
@@ -714,27 +714,53 @@ async fn get_sync(
     }
 }
 
-#[derive(Deserialize)]
+/// `GET /v1/repositories`'s query. `topic` may be repeated (any of them), which serde's query
+/// extractor cannot read into a list, so the pairs are read by hand, and a key nobody knows is
+/// refused rather than ignored: a typo would otherwise list everything.
+#[derive(Default)]
 struct RepoQuery {
     connection: Option<String>,
-    topic: Option<String>,
-    archived: Option<bool>,
-    #[serde(default)]
+    select: Selector,
     include_inaccessible: bool,
     cursor: Option<String>,
     limit: Option<i64>,
 }
 
+impl RepoQuery {
+    fn parse(pairs: Vec<(String, String)>) -> Result<RepoQuery, ApiError> {
+        let mut q = RepoQuery::default();
+        for (key, value) in pairs {
+            let bad = |what: &str| ApiError::bad(format!("{key}={value:?} is not {what}"));
+            match key.as_str() {
+                "connection" => q.connection = Some(value),
+                "topic" => q.select.topic.push(value),
+                "name" => q.select.name = Some(value),
+                "archived" => {
+                    q.select.archived = Some(value.parse().map_err(|_| bad("true or false"))?)
+                }
+                "include_inaccessible" => {
+                    q.include_inaccessible = value.parse().map_err(|_| bad("true or false"))?
+                }
+                "cursor" => q.cursor = Some(value),
+                "limit" => q.limit = Some(value.parse().map_err(|_| bad("a number"))?),
+                _ => return Err(ApiError::bad(format!("unknown query parameter {key:?}"))),
+            }
+        }
+        Ok(q)
+    }
+}
+
 async fn list_repositories(
     State(s): State<AppState>,
     h: HeaderMap,
-    Query(q): Query<RepoQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> ApiResult<Json<RepositoryList>> {
     authorized(&s, &h)?;
+    let q = RepoQuery::parse(pairs)?;
     let connection = match &q.connection {
         Some(key) => {
             let c = s.store.connection(key).await?;
-            if q.topic.is_some() && !c.forge.caps().topics {
+            if !q.select.topic.is_empty() && !c.forge.caps().topics {
                 return Err(ApiError::bad(format!(
                     "{} has no repository topics, so connection {:?} cannot be filtered by topic",
                     c.forge, c.name
@@ -748,8 +774,7 @@ async fn list_repositories(
         .store
         .repositories(&RepoFilter {
             connection,
-            topic: q.topic,
-            archived: q.archived,
+            select: q.select,
             include_inaccessible: q.include_inaccessible,
             cursor: q.cursor,
             limit: q.limit.unwrap_or(500),
@@ -758,12 +783,41 @@ async fn list_repositories(
     Ok(Json(RepositoryList {
         items: page.items,
         next_cursor: page.next_cursor,
+        unselected: page.unselected,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pairs(q: &str) -> Vec<(String, String)> {
+        q.split('&')
+            .filter_map(|p| p.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_repository_query_reads_a_repeated_topic() {
+        let q = RepoQuery::parse(pairs(
+            "topic=node&topic=go&name=*-starter&archived=false&limit=5",
+        ))
+        .map_err(|_| "a query this API reads")
+        .unwrap();
+        assert_eq!(q.select.topic, ["node", "go"]);
+        assert_eq!(q.select.name.as_deref(), Some("*-starter"));
+        assert_eq!(q.select.archived, Some(false));
+        assert_eq!(q.limit, Some(5));
+    }
+
+    #[test]
+    fn a_repository_query_refuses_what_it_does_not_know() {
+        // A typo must not list everything.
+        assert!(RepoQuery::parse(pairs("topics=node")).is_err());
+        assert!(RepoQuery::parse(pairs("archived=maybe")).is_err());
+        assert!(RepoQuery::parse(pairs("limit=many")).is_err());
+    }
 
     #[test]
     fn comparison() {
