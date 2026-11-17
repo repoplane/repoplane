@@ -32,6 +32,7 @@ async fn runs() {
     a_failed_sync_fails_the_step_in_flight(&store).await;
     a_repository_refused_is_unread_and_keeps_its_head(&store).await;
     a_refresh_refused_everything_fails(&store).await;
+    a_head_read_before_the_recorded_one_is_dropped(&store).await;
 }
 
 async fn start() -> (ContainerAsync<GenericImage>, Store) {
@@ -95,6 +96,7 @@ fn head(id: &str, branch: &str, sha: char) -> ObservedHead {
         branch: Some(branch.into()),
         head: Some(sha.to_string().repeat(40)),
         unread: None,
+        read_at: None,
     }
 }
 fn unread(id: &str, branch: &str) -> ObservedHead {
@@ -103,6 +105,14 @@ fn unread(id: &str, branch: &str) -> ObservedHead {
         branch: Some(branch.into()),
         head: None,
         unread: Some("git ls-remote: 403 You are not allowed to download code".into()),
+        read_at: None,
+    }
+}
+/// A HEAD as the worker read it at `secs` seconds past an arbitrary start.
+fn head_at(id: &str, branch: &str, sha: char, secs: i64) -> ObservedHead {
+    ObservedHead {
+        read_at: Some(chrono::DateTime::UNIX_EPOCH + chrono::Duration::seconds(secs)),
+        ..head(id, branch, sha)
     }
 }
 async fn heads_of(store: &Store, c: &Connection) -> Vec<(String, Option<String>)> {
@@ -420,4 +430,56 @@ async fn a_refresh_refused_everything_fails(store: &Store) {
     let e = store.finish_refresh(r).await.unwrap_err().to_string();
     assert!(e.contains("none of 2 HEADs: 2 repositories refused"), "{e}");
     assert!(e.contains("org/a: git ls-remote: 403"), "{e}");
+}
+
+/// A slow refresh records what it read after another has recorded a later read of the same
+/// repository: the earlier read is dropped, whatever order the two arrive in, and is counted in
+/// neither `observed` nor `changed`. One read twice, as Temporal repeats a step, is recorded
+/// both times, and a read with no time (a worker that does not say) is recorded as before.
+async fn a_head_read_before_the_recorded_one_is_dropped(store: &Store) {
+    let c = connection(store, "q-slow").await;
+    reconcile(store, &c, &[repo("a", "main", &[])]).await;
+    let (slow, _) = refresh(store, &c, RefreshHeads::default()).await;
+    let (quick, _) = refresh(store, &c, RefreshHeads::default()).await;
+
+    // The refresh that started second records first, with the later read.
+    store
+        .record_heads(quick, &[head_at("a", "main", '2', 200)])
+        .await
+        .unwrap();
+    // The slow one arrives with a read from before it: dropped, and not counted.
+    let changed = store
+        .record_heads(slow, &[head_at("a", "main", '1', 100)])
+        .await
+        .unwrap();
+    assert_eq!(changed, 0);
+    assert_eq!(
+        heads_of(store, &c).await,
+        vec![("a".to_string(), Some("2".repeat(40)))]
+    );
+    let slow_run = store.head_refresh(slow).await.unwrap();
+    assert_eq!((slow_run.observed, slow_run.changed), (0, 0));
+
+    // The same read again, and a later one, are recorded.
+    store
+        .record_heads(quick, &[head_at("a", "main", '2', 200)])
+        .await
+        .unwrap();
+    store
+        .record_heads(slow, &[head_at("a", "main", '3', 300)])
+        .await
+        .unwrap();
+    assert_eq!(
+        heads_of(store, &c).await,
+        vec![("a".to_string(), Some("3".repeat(40)))]
+    );
+    // A read with no time is not compared: recorded as before.
+    store
+        .record_heads(slow, &[head("a", "main", '4')])
+        .await
+        .unwrap();
+    assert_eq!(
+        heads_of(store, &c).await,
+        vec![("a".to_string(), Some("4".repeat(40)))]
+    );
 }

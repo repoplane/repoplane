@@ -33,6 +33,7 @@ struct Target {
     default_branch: Option<String>,
     head_sha: Option<String>,
     head_observed_at: Option<DateTime<Utc>>,
+    head_read_at: Option<DateTime<Utc>>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -305,7 +306,9 @@ impl Store {
     /// refresh ran) describes the old branch and is dropped. Each target counts once per
     /// refresh, repeats included: *observed* when first recorded, *changed* when that differs
     /// from what was recorded before the refresh, *unread* when the forge would not let the
-    /// token read it, which leaves its recorded HEAD as it was.
+    /// token read it, which leaves its recorded HEAD as it was. A HEAD the worker read before
+    /// the one already recorded (a slow refresh, or another running over the same repositories)
+    /// is dropped, and counted in none of them.
     pub async fn record_heads(
         &self,
         refresh: HeadRefreshId,
@@ -331,7 +334,8 @@ impl Store {
         }
         let ids: Vec<&str> = heads.iter().map(|h| h.external_id.as_str()).collect();
         let targets: HashMap<String, Target> = sqlx::query_as::<_, Target>(
-            "select r.id, r.external_id, r.default_branch, r.head_sha, r.head_observed_at
+            "select r.id, r.external_id, r.default_branch, r.head_sha, r.head_observed_at,
+                    r.head_read_at
              from head_refreshes h join repositories r on r.id = any(h.targets)
              where h.id = $1 and r.status = 'active' and r.external_id = any($2)
              for update of r",
@@ -368,6 +372,12 @@ impl Store {
             if t.default_branch != h.branch {
                 continue; // read from a branch that is no longer the default
             }
+            if h.read_at
+                .zip(t.head_read_at)
+                .is_some_and(|(read, kept)| read < kept)
+            {
+                continue; // read before the HEAD already recorded: not newer, not counted
+            }
             let first_this_refresh = t.head_observed_at.is_none_or(|at| at < started_at);
             if first_this_refresh {
                 observed += 1;
@@ -376,10 +386,12 @@ impl Store {
                 }
             }
             sqlx::query(
-                "update repositories set head_sha = $2, head_observed_at = now() where id = $1",
+                "update repositories set head_sha = $2, head_observed_at = now(), head_read_at = $3
+                 where id = $1",
             )
             .bind(t.id)
             .bind(&h.head)
+            .bind(h.read_at)
             .execute(&mut *tx)
             .await?;
         }
