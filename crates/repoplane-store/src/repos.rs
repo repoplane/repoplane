@@ -3,7 +3,8 @@
 
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use repoplane_proto::api::{Repository, RepositoryStatus};
+use repoplane_proto::api::{Repository, RepositoryStatus, Selector, Unselected};
+use repoplane_proto::forge::ForgeKind;
 use repoplane_proto::id::{ConnectionId, RepositoryId};
 use uuid::Uuid;
 
@@ -12,8 +13,7 @@ use crate::{Result, Store, StoreError};
 #[derive(Debug, Default, Clone)]
 pub struct RepoFilter {
     pub connection: Option<ConnectionId>,
-    pub topic: Option<String>,
-    pub archived: Option<bool>,
+    pub select: Selector,
     /// Include repositories absent from the latest complete listing.
     pub include_inaccessible: bool,
     pub cursor: Option<String>,
@@ -23,6 +23,54 @@ pub struct RepoFilter {
 pub struct RepoPage {
     pub items: Vec<Repository>,
     pub next_cursor: Option<String>,
+    /// On the first page only: what the selector could not decide, per connection.
+    pub unselected: Vec<Unselected>,
+}
+
+/// A selector as a SQL condition on `repositories` (ADR 0015), its parameters numbered from
+/// `first`: topics, name pattern, archived. True selects; null is unknown (a forge without
+/// topics); false rules out, whatever else is unknown.
+pub(crate) fn selector_condition(first: usize) -> String {
+    let (t, n, a) = (first, first + 1, first + 2);
+    format!(
+        "(cardinality(${t}::text[]) = 0 or topics && ${t}::text[])
+         and (${n}::text is null or name ilike ${n})
+         and (${a}::boolean is null or archived = ${a})"
+    )
+}
+
+/// The selector's values in the order [`selector_condition`] numbers them.
+pub(crate) struct SelectorArgs {
+    pub topics: Vec<String>,
+    pub name_like: Option<String>,
+    pub archived: Option<bool>,
+}
+
+impl SelectorArgs {
+    pub(crate) fn new(s: &Selector) -> Result<SelectorArgs> {
+        s.validate().map_err(StoreError::Invalid)?;
+        Ok(SelectorArgs {
+            topics: s.topic.clone(),
+            name_like: s.name.as_deref().map(like_pattern),
+            archived: s.archived,
+        })
+    }
+}
+
+/// A name pattern as a `like` pattern: `*` is any run of characters, anything else is itself.
+fn like_pattern(glob: &str) -> String {
+    let mut out = String::with_capacity(glob.len());
+    for c in glob.chars() {
+        match c {
+            '*' => out.push('%'),
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[derive(sqlx::FromRow)]
@@ -54,23 +102,25 @@ impl Store {
             }
             None => (None, None),
         };
-        let rows: Vec<RepoRow> = sqlx::query_as(
+        let sel = SelectorArgs::new(&f.select)?;
+        let rows: Vec<RepoRow> = sqlx::query_as(&format!(
             "select id, connection_id, external_id, full_name, name, default_branch, archived,
                     topics, head_sha, head_observed_at, empty, web_url, status, first_seen_at, last_seen_at
              from repositories
              where organization_id = $1
                and ($2::uuid is null or connection_id = $2)
-               and ($3::text is null or $3 = any(topics))
-               and ($4::boolean is null or archived = $4)
-               and ($5 or status = 'active')
-               and ($6::text is null or (full_name, id) > ($6, $7::uuid))
+               and ({})
+               and ($6 or status = 'active')
+               and ($7::text is null or (full_name, id) > ($7, $8::uuid))
              order by full_name, id
-             limit $8",
-        )
+             limit $9",
+            selector_condition(3)
+        ))
         .bind(self.org.uuid())
         .bind(f.connection.map(|c| c.uuid()))
-        .bind(&f.topic)
-        .bind(f.archived)
+        .bind(&sel.topics)
+        .bind(&sel.name_like)
+        .bind(sel.archived)
         .bind(f.include_inaccessible)
         .bind(after_name)
         .bind(after_id)
@@ -87,7 +137,52 @@ impl Store {
             (true, Some(last)) => Some(encode_cursor(&last.full_name, last.id.uuid())),
             _ => None,
         };
-        Ok(RepoPage { items, next_cursor })
+        let unselected = if f.cursor.is_none() && !f.select.topic.is_empty() {
+            self.unselected(f, &sel).await?
+        } else {
+            Vec::new()
+        };
+        Ok(RepoPage {
+            items,
+            next_cursor,
+            unselected,
+        })
+    }
+
+    /// The repositories the selector is null for, per connection: the ones a forge without
+    /// topics cannot say anything about.
+    async fn unselected(&self, f: &RepoFilter, sel: &SelectorArgs) -> Result<Vec<Unselected>> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+            "select c.name, c.forge, u.n
+             from (select connection_id, count(*) as n
+                   from repositories
+                   where organization_id = $1
+                     and ($2::uuid is null or connection_id = $2)
+                     and ($6 or status = 'active')
+                     and ({}) is null
+                   group by connection_id) u
+             join connections c on c.id = u.connection_id
+             order by c.name",
+            selector_condition(3)
+        ))
+        .bind(self.org.uuid())
+        .bind(f.connection.map(|c| c.uuid()))
+        .bind(&sel.topics)
+        .bind(&sel.name_like)
+        .bind(sel.archived)
+        .bind(f.include_inaccessible)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(connection, forge, count)| {
+                let forge: ForgeKind = forge.parse().map_err(StoreError::Invalid)?;
+                Ok(Unselected {
+                    connection,
+                    count,
+                    reason: format!("{forge} has no repository topics"),
+                })
+            })
+            .collect()
     }
 }
 
@@ -133,6 +228,15 @@ fn decode_cursor(c: &str) -> Result<(String, Uuid)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_pattern_becomes_a_like_pattern() {
+        assert_eq!(like_pattern("*-starter"), "%-starter");
+        assert_eq!(like_pattern("s4a-roma-*-starter"), "s4a-roma-%-starter");
+        // What `like` would read as a wildcard is the repository's own character.
+        assert_eq!(like_pattern("my_repo%"), "my\\_repo\\%");
+        assert_eq!(like_pattern("a\\b"), "a\\\\b");
+    }
 
     #[test]
     fn cursor_round_trips() {

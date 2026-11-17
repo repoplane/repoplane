@@ -4,10 +4,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use repoplane_proto::api::{
-    Connection, ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile, RefreshHeads,
-    RepositoryList, Sync,
+    Connection, ConnectionList, CreateConnection, ErrorBody, HeadRefresh, Reconcile,
+    RepositoryList, Selector, Sync,
 };
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::context::Context;
@@ -18,18 +17,36 @@ pub struct Client {
     token: String,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default)]
 pub struct RepoQuery {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topic: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archived: Option<bool>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub select: Selector,
     pub include_inaccessible: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+}
+
+impl RepoQuery {
+    /// The query string's pairs: a topic repeats, which a serialised struct cannot say.
+    fn pairs(&self) -> Vec<(&'static str, String)> {
+        let mut p = Vec::new();
+        if let Some(c) = &self.connection {
+            p.push(("connection", c.clone()));
+        }
+        p.extend(self.select.topic.iter().map(|t| ("topic", t.clone())));
+        if let Some(n) = &self.select.name {
+            p.push(("name", n.clone()));
+        }
+        if let Some(a) = self.select.archived {
+            p.push(("archived", a.to_string()));
+        }
+        if self.include_inaccessible {
+            p.push(("include_inaccessible", "true".into()));
+        }
+        if let Some(c) = &self.cursor {
+            p.push(("cursor", c.clone()));
+        }
+        p
+    }
 }
 
 impl Client {
@@ -102,15 +119,11 @@ impl Client {
         self.send(req).await
     }
 
-    pub async fn refresh_heads(
-        &self,
-        key: &str,
-        filter: &RefreshHeads,
-    ) -> anyhow::Result<HeadRefresh> {
+    pub async fn refresh_heads(&self, key: &str, select: &Selector) -> anyhow::Result<HeadRefresh> {
         self.send(
             self.http
                 .post(self.url(&format!("/connections/{}/head-refreshes", seg(key))))
-                .json(filter),
+                .json(select),
         )
         .await
     }
@@ -132,7 +145,7 @@ impl Client {
     }
 
     pub async fn repositories(&self, q: &RepoQuery) -> anyhow::Result<RepositoryList> {
-        self.send(self.http.get(self.url("/repositories")).query(q))
+        self.send(self.http.get(self.url("/repositories")).query(&q.pairs()))
             .await
     }
 

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use repoplane_proto::ForgeKind;
-use repoplane_proto::api::{AuthMode, CreateConnection, RefreshHeads, RunStatus};
+use repoplane_proto::api::{AuthMode, CreateConnection, RunStatus, Selector};
 
 use crate::client::{Client, RepoQuery};
 
@@ -115,16 +115,38 @@ enum Auth {
     Token,
 }
 
+/// Which repositories a command acts on (ADR 0015); the flags combine with AND.
+#[derive(clap::Args, Default)]
+struct SelectArgs {
+    /// Only repositories with this topic; repeat for any of several.
+    #[arg(long)]
+    topic: Vec<String>,
+    /// Only repositories whose name matches, `*` standing for any characters: `*-starter`,
+    /// `s4a-roma-*-starter`. The name is the last path segment, so no `/`.
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    archived: Option<bool>,
+}
+
+impl From<SelectArgs> for Selector {
+    fn from(a: SelectArgs) -> Selector {
+        Selector {
+            topic: a.topic,
+            name: a.name,
+            archived: a.archived,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum RepoCmd {
     /// List repositories, across connections unless --connection is given.
     List {
         #[arg(long)]
         connection: Option<String>,
-        #[arg(long)]
-        topic: Option<String>,
-        #[arg(long)]
-        archived: Option<bool>,
+        #[command(flatten)]
+        select: SelectArgs,
         /// Include repositories absent from the latest complete listing.
         #[arg(long)]
         include_inaccessible: bool,
@@ -134,10 +156,8 @@ enum RepoCmd {
     RefreshHeads {
         #[arg(long)]
         connection: Option<String>,
-        #[arg(long)]
-        topic: Option<String>,
-        #[arg(long)]
-        archived: Option<bool>,
+        #[command(flatten)]
+        select: SelectArgs,
         /// Wait for every refresh to finish, and exit non-zero if one fails.
         #[arg(long)]
         wait: bool,
@@ -264,8 +284,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Repo(RepoCmd::RefreshHeads {
             connection,
-            topic,
-            archived,
+            select,
             wait,
             timeout,
         }) => {
@@ -273,10 +292,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Some(c) => vec![api.connection(&c).await?],
                 None => api.connections().await?.items,
             };
-            let filter = RefreshHeads { topic, archived };
+            let select = Selector::from(select);
             let mut runs = Vec::new();
             for c in &connections {
-                if filter.topic.is_some() && !c.forge.caps().topics && connections.len() > 1 {
+                if !select.topic.is_empty() && !c.forge.caps().topics && connections.len() > 1 {
                     eprintln!(
                         "repoplane: skipping {}: {} has no repository topics",
                         c.name, c.forge
@@ -285,7 +304,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
                 runs.push((
                     c.name.clone(),
-                    api.refresh_heads(&c.id.to_string(), &filter).await?,
+                    api.refresh_heads(&c.id.to_string(), &select).await?,
                 ));
             }
             let mut status = ReconcileOrRefresh::default();
@@ -313,20 +332,27 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Repo(RepoCmd::List {
             connection,
-            topic,
-            archived,
+            select,
             include_inaccessible,
         }) => {
             let mut q = RepoQuery {
                 connection,
-                topic,
-                archived,
+                select: select.into(),
                 include_inaccessible,
                 cursor: None,
             };
             let mut items = Vec::new();
             loop {
                 let page = api.repositories(&q).await?;
+                // Reported on the first page: what the topic could not decide.
+                if q.cursor.is_none() {
+                    for u in &page.unselected {
+                        eprintln!(
+                            "repoplane: not listed: {} repositories of {}: {}",
+                            u.count, u.connection, u.reason
+                        );
+                    }
+                }
                 items.extend(page.items);
                 match page.next_cursor {
                     Some(c) => q.cursor = Some(c),
@@ -448,6 +474,10 @@ mod tests {
             "list",
             "--topic",
             "node",
+            "--topic",
+            "go",
+            "--name",
+            "*-starter",
             "--archived",
             "false",
         ])

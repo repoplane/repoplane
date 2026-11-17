@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use repoplane_proto::ForgeKind;
 use repoplane_proto::api::{
-    AuthMode, Connection, CreateConnection, RefreshHeads, RepositoryStatus, RunStatus,
+    AuthMode, Connection, CreateConnection, RepositoryStatus, RunStatus, Selector, Unselected,
 };
 use repoplane_proto::id::{ConnectionId, HeadRefreshId};
 use repoplane_proto::inventory::{ObservedHead, RepoSnapshot};
@@ -33,6 +33,7 @@ async fn runs() {
     a_repository_refused_is_unread_and_keeps_its_head(&store).await;
     a_refresh_refused_everything_fails(&store).await;
     a_head_read_before_the_recorded_one_is_dropped(&store).await;
+    a_selector_chooses_and_counts_what_it_cannot_say(&store).await;
 }
 
 async fn start() -> (ContainerAsync<GenericImage>, Store) {
@@ -61,14 +62,17 @@ async fn start() -> (ContainerAsync<GenericImage>, Store) {
     panic!("Postgres never answered");
 }
 async fn connection(store: &Store, queue: &str) -> Connection {
+    connection_of(store, queue, ForgeKind::Forgejo).await
+}
+async fn connection_of(store: &Store, queue: &str, forge: ForgeKind) -> Connection {
     store
         .create_connection(
             ConnectionId::new(),
             &CreateConnection {
                 name: queue.into(),
-                forge: ForgeKind::Forgejo,
+                forge,
                 org: queue.into(),
-                base_url: Some("http://forgejo.test".into()),
+                base_url: Some("http://forge.test".into()),
                 auth: AuthMode::Token,
                 queue: Some(queue.into()),
                 skip_check: false,
@@ -141,11 +145,7 @@ async fn reconcile(store: &Store, c: &Connection, repos: &[RepoSnapshot]) {
 }
 
 /// A started refresh of `c`'s repositories: its id and its targets' forge ids.
-async fn refresh(
-    store: &Store,
-    c: &Connection,
-    filter: RefreshHeads,
-) -> (HeadRefreshId, Vec<String>) {
+async fn refresh(store: &Store, c: &Connection, filter: Selector) -> (HeadRefreshId, Vec<String>) {
     let r = store.request_head_refresh(c, &filter).await.unwrap();
     let targets = store.start_refresh(r.id).await.unwrap();
     (
@@ -168,7 +168,7 @@ async fn repositories_without_a_locator_are_not_refreshed(store: &Store) {
     .await
     .unwrap();
     let r = store
-        .request_head_refresh(&c, &RefreshHeads::default())
+        .request_head_refresh(&c, &Selector::default())
         .await
         .unwrap();
     assert_eq!(r.targeted, 1);
@@ -187,7 +187,7 @@ async fn repositories_without_a_locator_are_not_refreshed(store: &Store) {
 async fn a_head_read_from_a_branch_no_longer_default_is_dropped(store: &Store) {
     let c = connection(store, "q-branch").await;
     reconcile(store, &c, &[repo("a", "main", &[])]).await;
-    let (r, _) = refresh(store, &c, RefreshHeads::default()).await;
+    let (r, _) = refresh(store, &c, Selector::default()).await;
 
     reconcile(store, &c, &[repo("a", "develop", &[])]).await;
     assert_eq!(
@@ -218,7 +218,7 @@ async fn a_head_read_from_a_branch_no_longer_default_is_dropped(store: &Store) {
 async fn a_repeated_record_counts_each_target_once(store: &Store) {
     let c = connection(store, "q-retry").await;
     reconcile(store, &c, &[repo("a", "main", &[]), repo("b", "main", &[])]).await;
-    let (r, _) = refresh(store, &c, RefreshHeads::default()).await;
+    let (r, _) = refresh(store, &c, Selector::default()).await;
     store
         .record_heads(r, &[head("a", "main", '1')])
         .await
@@ -245,9 +245,9 @@ async fn heads_outside_the_targets_are_ignored(store: &Store) {
     let (id, targets) = refresh(
         store,
         &c,
-        RefreshHeads {
-            topic: Some("t".into()),
-            archived: None,
+        Selector {
+            topic: vec!["t".into()],
+            ..Selector::default()
         },
     )
     .await;
@@ -386,14 +386,14 @@ async fn a_failed_sync_fails_the_step_in_flight(store: &Store) {
 async fn a_repository_refused_is_unread_and_keeps_its_head(store: &Store) {
     let c = connection(store, "q-unread").await;
     reconcile(store, &c, &[repo("a", "main", &[]), repo("b", "main", &[])]).await;
-    let (first, _) = refresh(store, &c, RefreshHeads::default()).await;
+    let (first, _) = refresh(store, &c, Selector::default()).await;
     store
         .record_heads(first, &[head("a", "main", '1'), head("b", "main", '2')])
         .await
         .unwrap();
     store.finish_refresh(first).await.unwrap();
 
-    let (r, _) = refresh(store, &c, RefreshHeads::default()).await;
+    let (r, _) = refresh(store, &c, Selector::default()).await;
     for _ in 0..2 {
         store
             .record_heads(r, &[head("a", "main", '3'), unread("b", "main")])
@@ -422,7 +422,7 @@ async fn a_repository_refused_is_unread_and_keeps_its_head(store: &Store) {
 async fn a_refresh_refused_everything_fails(store: &Store) {
     let c = connection(store, "q-refused").await;
     reconcile(store, &c, &[repo("a", "main", &[]), repo("b", "main", &[])]).await;
-    let (r, _) = refresh(store, &c, RefreshHeads::default()).await;
+    let (r, _) = refresh(store, &c, Selector::default()).await;
     store
         .record_heads(r, &[unread("a", "main"), unread("b", "main")])
         .await
@@ -439,8 +439,8 @@ async fn a_refresh_refused_everything_fails(store: &Store) {
 async fn a_head_read_before_the_recorded_one_is_dropped(store: &Store) {
     let c = connection(store, "q-slow").await;
     reconcile(store, &c, &[repo("a", "main", &[])]).await;
-    let (slow, _) = refresh(store, &c, RefreshHeads::default()).await;
-    let (quick, _) = refresh(store, &c, RefreshHeads::default()).await;
+    let (slow, _) = refresh(store, &c, Selector::default()).await;
+    let (quick, _) = refresh(store, &c, Selector::default()).await;
 
     // The refresh that started second records first, with the later read.
     store
@@ -481,5 +481,113 @@ async fn a_head_read_before_the_recorded_one_is_dropped(store: &Store) {
     assert_eq!(
         heads_of(store, &c).await,
         vec![("a".to_string(), Some("4".repeat(40)))]
+    );
+}
+
+/// ADR 0015: the fields combine with AND; `*` is the only wildcard in a name, and `_` is not one;
+/// a forge without topics is unknown for a topic, so it is counted, not listed; a field that is
+/// false rules a repository out whatever else is unknown.
+async fn a_selector_chooses_and_counts_what_it_cannot_say(store: &Store) {
+    let c = connection(store, "q-select").await;
+    let ado = connection_of(store, "q-select-ado", ForgeKind::Azuredevops).await;
+    reconcile(
+        store,
+        &c,
+        &[
+            repo("java-starter", "main", &["sel-node"]),
+            repo("s4a-roma-web-starter", "main", &[]),
+            RepoSnapshot {
+                archived: true,
+                ..repo("old-starter", "main", &[])
+            },
+            repo("my_repo", "main", &[]),
+            repo("myXrepo", "main", &[]),
+        ],
+    )
+    .await;
+    reconcile(
+        store,
+        &ado,
+        &[RepoSnapshot {
+            topics: None,
+            ..repo("py-starter", "main", &[])
+        }],
+    )
+    .await;
+    let list = |select: Selector| async move {
+        let page = store
+            .repositories(&RepoFilter {
+                select,
+                limit: 100,
+                ..RepoFilter::default()
+            })
+            .await
+            .unwrap();
+        let mut ids: Vec<String> = page.items.into_iter().map(|r| r.external_id).collect();
+        ids.sort();
+        (ids, page.unselected)
+    };
+    let sel = |topic: &[&str], name: Option<&str>, archived: Option<bool>| Selector {
+        topic: topic.iter().map(|t| t.to_string()).collect(),
+        name: name.map(String::from),
+        archived,
+    };
+
+    let (ids, unknown) = list(sel(&[], Some("*-starter"), None)).await;
+    assert_eq!(
+        ids,
+        [
+            "java-starter",
+            "old-starter",
+            "py-starter",
+            "s4a-roma-web-starter"
+        ]
+    );
+    assert!(unknown.is_empty(), "no topic asked, nothing is unknown");
+    let (ids, _) = list(sel(&[], Some("*-STARTER"), Some(false))).await;
+    assert_eq!(ids, ["java-starter", "py-starter", "s4a-roma-web-starter"]);
+    let (ids, _) = list(sel(&[], Some("s4a-roma-*-starter"), None)).await;
+    assert_eq!(ids, ["s4a-roma-web-starter"]);
+    let (ids, _) = list(sel(&[], Some("my_repo"), None)).await;
+    assert_eq!(
+        ids,
+        ["my_repo"],
+        "an underscore is a character, not a wildcard"
+    );
+
+    // A topic: the forge that has none is counted, with its reason, not listed as a non-match.
+    let (ids, unknown) = list(sel(&["sel-node"], None, None)).await;
+    assert_eq!(ids, ["java-starter"]);
+    assert_eq!(
+        unknown,
+        [Unselected {
+            connection: "q-select-ado".into(),
+            count: 1,
+            reason: "azuredevops has no repository topics".into(),
+        }]
+    );
+    // Ruled out by its name, py-starter is no longer unknown.
+    let (ids, unknown) = list(sel(&["sel-node"], Some("zzz*"), None)).await;
+    assert!(ids.is_empty() && unknown.is_empty());
+
+    // The same selector chooses a head refresh's targets.
+    let (_, targets) = refresh(store, &c, sel(&[], Some("*-starter"), Some(false))).await;
+    assert_eq!(targets.len(), 2);
+    // A name with a '/' is refused, and so is a topic on a forge that has none.
+    assert!(
+        store
+            .repositories(&RepoFilter {
+                select: sel(&[], Some("acme/*-starter"), None),
+                limit: 10,
+                ..RepoFilter::default()
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .request_head_refresh(&ado, &sel(&["sel-node"], None, None))
+            .await
+            .is_err()
     );
 }

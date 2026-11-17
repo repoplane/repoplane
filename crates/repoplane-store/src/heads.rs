@@ -3,10 +3,11 @@
 //! asked for, whatever a reconcile does meanwhile.
 
 use chrono::{DateTime, Utc};
-use repoplane_proto::api::{Connection, HeadRefresh, RefreshHeads, UNREAD_SHOWN, UnreadRepository};
+use repoplane_proto::api::{Connection, HeadRefresh, Selector, UNREAD_SHOWN, UnreadRepository};
 use repoplane_proto::id::{ConnectionId, HeadRefreshId};
 use uuid::Uuid;
 
+use crate::repos::{SelectorArgs, selector_condition};
 use crate::{Result, Store, StoreError, parse_status};
 
 #[derive(sqlx::FromRow)]
@@ -44,33 +45,35 @@ impl Row {
 }
 
 impl Store {
-    /// Starts reading the HEADs of a connection's active repositories that match `filter`.
+    /// Starts reading the HEADs of a connection's active repositories that `select` selects.
     /// With nothing to read, the refresh is finished as it is created.
     pub async fn request_head_refresh(
         &self,
         connection: &Connection,
-        filter: &RefreshHeads,
+        select: &Selector,
     ) -> Result<HeadRefresh> {
-        if filter.topic.is_some() && !connection.forge.caps().topics {
+        let sel = SelectorArgs::new(select)?;
+        if !select.topic.is_empty() && !connection.forge.caps().topics {
             return Err(StoreError::Invalid(format!(
                 "{} has no repository topics, so connection {:?} cannot be filtered by topic",
                 connection.forge, connection.name
             )));
         }
         let mut tx = self.pool.begin().await?;
-        let targets: Vec<Uuid> = sqlx::query_scalar(
+        let targets: Vec<Uuid> = sqlx::query_scalar(&format!(
             "select id from repositories
              where connection_id = $1 and status = 'active'
                -- Without a locator the worker cannot find a repository again; the next
                -- reconcile writes one (rows recorded before migration 0002 have none).
                and locator <> ''
-               and ($2::text is null or $2 = any(topics))
-               and ($3::boolean is null or archived = $3)
+               and ({})
              order by full_name",
-        )
+            selector_condition(2)
+        ))
         .bind(connection.id.uuid())
-        .bind(&filter.topic)
-        .bind(filter.archived)
+        .bind(&sel.topics)
+        .bind(&sel.name_like)
+        .bind(sel.archived)
         .fetch_all(&mut *tx)
         .await?;
         let id = HeadRefreshId::new();

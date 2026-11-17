@@ -19,7 +19,7 @@ the selection.
 
 | Field | Matches |
 |---|---|
-| `connection` | repositories of that connection |
+| `connection` | repositories of that connection; an operation that already names one (a head refresh) takes it from there |
 | `topic` | repositories with the topic; a list means any of them |
 | `name` | the repository's last path segment, case-insensitively, with `*` for any run of characters (`*-starter`, `s4a-roma-*-starter`) |
 | `archived` | archived or not (disabled, on Azure DevOps) |
@@ -50,7 +50,8 @@ CLI flags (`--topic`, `--name`, `--archived`) build the same value.
 
 The `topic` and `archived` filters of `repo list` and `repo refresh-heads` become selectors; their
 query parameters and flags keep working. The CLI's own "skipping <connection>: no repository
-topics" line goes, replaced by the counts every selector use returns.
+topics" line stays for `refresh-heads` across connections, where each connection is its own run
+and the API refuses a topic on a forge without them; `repo list` reports counts instead.
 
 A leading `*` cannot use an index, so a name selector scans the connection's rows: microseconds at
 a few thousand repositories, not worth an index.
