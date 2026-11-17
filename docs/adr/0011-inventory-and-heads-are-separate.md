@@ -5,7 +5,8 @@
 ## Context
 
 Listing an organisation costs one request per page of repositories. Reading default-branch
-HEADs costs one request per repository, and most of a run's time and rate budget. Yet a HEAD
+HEADs costs one git request per repository (`ls-remote`, outside the forge's API quota), and
+most of a run's time. Yet a HEAD
 recorded at reconcile time is stale by the time a scan uses it. A scan has to resolve the exact
 commit it checks out anyway, and a scan of seventeen repositories should not pay for the other
 hundred.

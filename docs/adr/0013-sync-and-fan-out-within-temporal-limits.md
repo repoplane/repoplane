@@ -48,13 +48,12 @@ stayed `running` with nothing recording why.
 
 ## Consequences
 
-Measured on the 2,139-repository sandbox (2026-10-05, debug build, 32 worker slots):
-- a sync takes 40 s: reconcile 2.8 s, head refresh 37.4 s across 3 slices;
+Measured on the 2,139-repository sandbox (2026-10-05, debug build):
+- with 32 worker slots a sync took 40 s: reconcile 2.8 s, head refresh 37.4 s across 3 slices.
+  The default is now 64 slots, which halves HEAD reading on GitHub and GitLab: a GitHub sync of
+  the same organisation takes about 25 s;
 - the slice histories hold about 4,000 events per 1,000 repositories.
 
 The listing is the next limit. A reconcile's history carries every page it recorded, about
 1.8 MB for 2,139 repositories, against Temporal's 50 MB per workflow. Organisations past a few
 tens of thousands of repositories will need the listing in child workflows or continue-as-new.
-
-Update 2026-10-06: the worker's default rose to 64 slots, which halves HEAD reading on GitHub and
-GitLab (a GitHub sync of 2,139 repositories went from about 40 s to about 25 s).
