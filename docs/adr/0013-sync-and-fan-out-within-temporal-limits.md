@@ -38,6 +38,14 @@ stayed `running` with nothing recording why.
 
   A failed sync fails its step in flight too, since Temporal ends a child when its parent closes.
 
+  This is the API's job, and a workflow timeout cannot do it. Temporal retries a failing
+  workflow task for ever, so such a workflow never fails by itself. A run may last hours (a
+  rate-limited forge call waits up to an hour, for up to 30 attempts), so a timeout long enough
+  for a healthy run would not end a stuck one in time, and a shorter one would end healthy runs.
+  A timeout also says nothing of the cause, where the failed task names it (for example the
+  2,000 pending activities limit). Only the API writes a run's end into Postgres, so it already
+  looks at every run in flight.
+
 ## Consequences
 
 Measured on the 2,139-repository sandbox (2026-10-05, debug build, 32 worker slots):
