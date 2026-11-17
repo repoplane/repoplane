@@ -16,14 +16,12 @@ use repoplane_proto::inventory::{
 
 // --- forge activities: on the connection's queue, in repoplane-worker --------------------------
 
-/// Attempts a forge call gets when it fails the ordinary way: a forge busy or unreachable,
-/// backing off from 1s to 60s, so about two minutes. The worker ends the retries there itself.
-pub const FORGE_ATTEMPTS: u32 = 8;
-
-/// Attempts a forge call gets while the forge says it is rate limiting, each after the wait it
-/// asked for (a minute when it does not say): about half an hour of quota windows. At gitlab.com
-/// Free's 100 git requests a minute, that reads the HEADs of 1,500 repositories or more.
-pub const RATE_LIMITED_ATTEMPTS: u32 = 30;
+/// Attempts a forge call gets, whatever made the one before fail: Temporal's retry policy is the
+/// only rule. A forge busy or unreachable is tried again backing off from 1s to 60s, about
+/// 25 minutes in all; one that says it is rate limiting, after the wait it asked for (a minute
+/// when it does not say), which is about half an hour of quota windows. At gitlab.com Free's
+/// 100 git requests a minute, that reads the HEADs of 1,500 repositories or more.
+pub const FORGE_ATTEMPTS: u32 = 30;
 
 /// How long a forge call may go without a heartbeat before Temporal gives it up and tries again,
 /// on any worker: a worker killed mid-call costs this, not the call's 15-minute start-to-close

@@ -7,9 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use repoplane_flow::activities::{
-    FORGE_ATTEMPTS, ListPage, ListedPage, Lookup, MAX_RATE_LIMIT_WAIT, ReadHead,
-};
+use repoplane_flow::activities::{ListPage, ListedPage, Lookup, MAX_RATE_LIMIT_WAIT, ReadHead};
 use repoplane_forge::{Class, ForgeError, Listed, Lister, Transport};
 use repoplane_proto::inventory::{ConnectionSpec, ObservedHead, RepoSnapshot};
 use temporalio_macros::activities;
@@ -25,24 +23,23 @@ pub struct ForgeActivities {
     pub tokens: Arc<Tokens>,
 }
 
-/// A forge error as Temporal should treat it on `attempt`, the same on every forge:
-/// - the forge says it is rate limiting: retried after the wait it asked for (a minute when it
-///   does not say), up to
-///   [`RATE_LIMITED_ATTEMPTS`](repoplane_flow::activities::RATE_LIMITED_ATTEMPTS), since retrying
-///   within seconds lands in the same window and only spends the quota again;
-/// - the forge was busy or unreachable: retried with Temporal's backoff, up to
-///   [`FORGE_ATTEMPTS`];
+/// A forge error as Temporal should treat it, the same on every forge. The workflow's retry
+/// policy owns how many attempts there are; this only says what kind of failure it was:
+/// - the forge says it is rate limiting: retry after the wait it asked for (a minute when it
+///   does not say, an hour at most), since retrying within seconds lands in the same window and
+///   only spends the quota again;
+/// - the forge was busy or unreachable: retry with the policy's backoff;
 /// - it will never work (a bad token, no token for the forge, a protocol violation): not
 ///   retried.
 ///
 /// The message has already been scrubbed of the token by the HTTP layer.
-pub fn failure(e: ForgeError, attempt: u32) -> ActivityError {
+pub fn failure(e: ForgeError) -> ActivityError {
     let message = e.to_string();
     let failure = match e.rate_limit_wait() {
         Some(wait) => ApplicationFailure::builder(message)
             .next_retry_delay(wait.min(MAX_RATE_LIMIT_WAIT))
             .build(),
-        None if e.retryable() && attempt < FORGE_ATTEMPTS => ApplicationFailure::new(message),
+        None if e.retryable() => ApplicationFailure::new(message),
         None => ApplicationFailure::non_retryable(message),
     };
     ActivityError::application(failure)
@@ -81,15 +78,10 @@ impl ForgeActivities {
     fn lister(
         &self,
         c: &ConnectionSpec,
-        attempt: u32,
         cancel: CancellationToken,
     ) -> Result<Box<dyn Lister>, ActivityError> {
-        let token = self
-            .tokens
-            .for_connection(c)
-            .map_err(|e| failure(e, attempt))?;
-        repoplane_forge::lister(c, token, self.transport.clone(), cancel)
-            .map_err(|e| failure(e, attempt))
+        let token = self.tokens.for_connection(c).map_err(failure)?;
+        repoplane_forge::lister(c, token, self.transport.clone(), cancel).map_err(failure)
     }
 }
 
@@ -101,12 +93,12 @@ impl ForgeActivities {
         ctx: ActivityContext,
         input: ListPage,
     ) -> Result<ListedPage, ActivityError> {
-        let (attempt, cancel) = (ctx.info().attempt, CancellationToken::new());
-        let lister = self.lister(&input.connection, attempt, cancel.clone())?;
+        let cancel = CancellationToken::new();
+        let lister = self.lister(&input.connection, cancel.clone())?;
         alive(&ctx, &cancel, async {
             list_page(lister.as_ref(), input.cursor.as_deref())
                 .await
-                .map_err(|e| failure(e, attempt))
+                .map_err(failure)
         })
         .await
     }
@@ -117,12 +109,10 @@ impl ForgeActivities {
         ctx: ActivityContext,
         input: Lookup,
     ) -> Result<Option<RepoSnapshot>, ActivityError> {
-        let (attempt, cancel) = (ctx.info().attempt, CancellationToken::new());
-        let lister = self.lister(&input.connection, attempt, cancel.clone())?;
+        let cancel = CancellationToken::new();
+        let lister = self.lister(&input.connection, cancel.clone())?;
         let found = alive(&ctx, &cancel, async {
-            lookup(lister.as_ref(), &input.id)
-                .await
-                .map_err(|e| failure(e, attempt))
+            lookup(lister.as_ref(), &input.id).await.map_err(failure)
         })
         .await?;
         tracing::info!(
@@ -140,12 +130,12 @@ impl ForgeActivities {
         ctx: ActivityContext,
         input: ReadHead,
     ) -> Result<ObservedHead, ActivityError> {
-        let (attempt, cancel) = (ctx.info().attempt, CancellationToken::new());
-        let lister = self.lister(&input.connection, attempt, cancel.clone())?;
+        let cancel = CancellationToken::new();
+        let lister = self.lister(&input.connection, cancel.clone())?;
         alive(&ctx, &cancel, async {
             read_head(lister.as_ref(), input.target.repo)
                 .await
-                .map_err(|e| failure(e, attempt))
+                .map_err(failure)
         })
         .await
     }
@@ -206,18 +196,17 @@ mod tests {
     use super::*;
     use crate::fake::{Fake, listed};
 
-    fn decided(e: ForgeError, attempt: u32) -> (bool, Option<std::time::Duration>) {
-        let ActivityError::Application(f) = failure(e, attempt) else {
+    fn decided(e: ForgeError) -> (bool, Option<std::time::Duration>) {
+        let ActivityError::Application(f) = failure(e) else {
             panic!("a forge error becomes an application failure");
         };
         (f.is_non_retryable(), f.next_retry_delay())
     }
 
-    /// The same rules on every forge: a rate limit waits as long as the forge asked, past the
-    /// attempts an ordinary failure gets; a busy forge stops after them, as it always did; what
-    /// will never work is not retried.
+    /// The same rules on every forge, with no attempt count in them: a rate limit waits as long
+    /// as the forge asked, a busy forge backs off, and what will never work is not retried.
     #[test]
-    fn a_rate_limit_waits_and_outlasts_ordinary_failures() {
+    fn a_failure_says_what_kind_it_was() {
         use std::time::Duration;
         let limited = || ForgeError::Status {
             forge: "t",
@@ -233,14 +222,7 @@ mod tests {
             path: "/x".into(),
             message: "connection reset".into(),
         };
-        assert_eq!(
-            decided(limited(), 1),
-            (false, Some(Duration::from_secs(60)))
-        );
-        assert_eq!(
-            decided(limited(), FORGE_ATTEMPTS + 10),
-            (false, Some(Duration::from_secs(60)))
-        );
+        assert_eq!(decided(limited()), (false, Some(Duration::from_secs(60))));
         // A reset an hour and a half away waits at most an hour.
         let reset = ForgeError::RateLimitExceeded {
             forge: "t",
@@ -248,14 +230,9 @@ mod tests {
             path: "/x".into(),
             wait: Duration::from_secs(90 * 60),
         };
-        assert_eq!(decided(reset, 1), (false, Some(MAX_RATE_LIMIT_WAIT)));
-        assert_eq!(decided(busy(), 1), (false, None));
-        assert_eq!(decided(busy(), FORGE_ATTEMPTS - 1), (false, None));
-        assert_eq!(decided(busy(), FORGE_ATTEMPTS), (true, None));
-        assert_eq!(
-            decided(ForgeError::Config("no token".into()), 1),
-            (true, None)
-        );
+        assert_eq!(decided(reset), (false, Some(MAX_RATE_LIMIT_WAIT)));
+        assert_eq!(decided(busy()), (false, None));
+        assert_eq!(decided(ForgeError::Config("no token".into())), (true, None));
     }
 
     /// A repository the listing skipped still exists, under its current name; one that is
