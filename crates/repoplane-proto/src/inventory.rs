@@ -54,6 +54,11 @@ pub struct ObservedHead {
     /// 403): the HEAD is not known, and the one recorded before stays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unread: Option<String>,
+    /// When the worker had the forge's answer, by its own clock. A HEAD read before the one
+    /// already recorded is dropped, however late it arrives. Absent from a worker that does not
+    /// say, and from histories recorded before it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A repository the inventory holds as active that a reconcile's listing did not return. A

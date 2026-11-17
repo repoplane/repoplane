@@ -186,6 +186,7 @@ pub async fn read_head(
         branch: snapshot.default_branch,
         head,
         unread,
+        read_at: Some(chrono::Utc::now()),
     })
 }
 

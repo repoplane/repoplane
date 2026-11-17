@@ -178,6 +178,13 @@ it and naming it with the forge's reason. A refresh the forge gives no HEAD at a
 some, fails: a token every repository refuses is the token's problem. A 401 refuses the token
 itself, and fails the run at once.
 
+Each HEAD carries when the worker read it (`read_at`, the worker's clock), and the repository
+keeps the time of the HEAD it holds (`head_read_at`). A read from before the recorded one is
+dropped and counted nowhere: a slow refresh, or one running beside another over the same
+repositories, cannot put an older HEAD over a newer one. Nothing stops two refreshes of a
+connection running at once. Reads are compared with each other only, never with the database's
+clock; workers whose clocks differ can misorder their reads against one another's, by that much.
+
 **HEADs are read over git, not over the API.** One `git ls-remote <remote> refs/heads/<branch>`
 per repository, one activity each, as many at once as the worker has slots. Git traffic is not counted against the REST and GraphQL
 budgets, which is what made API-read HEADs expensive:
