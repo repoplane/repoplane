@@ -416,8 +416,6 @@ async fn settle(s: &AppState, run: Run, requested_at: chrono::DateTime<chrono::U
     }
 }
 
-/// What Temporal reports wrong with a workflow, from its `TemporalReportedProblems` attribute:
-/// `category=WorkflowTaskFailed, cause=WorkflowTaskFailedCausePendingActivitiesLimitExceeded`.
 /// Most workflows looked at under one run, so a check stays a handful of calls: a run has a
 /// child per step and per slice of 1,000 repositories.
 const MAX_DESCRIBED: usize = 32;
@@ -492,6 +490,8 @@ async fn stalled(s: &AppState, root: &DescribeWorkflowExecutionResponse) -> Opti
     None
 }
 
+/// What Temporal reports wrong with a workflow, from its `TemporalReportedProblems` attribute:
+/// `category=WorkflowTaskFailed, cause=WorkflowTaskFailedCausePendingActivitiesLimitExceeded`.
 fn problems(d: &DescribeWorkflowExecutionResponse) -> Option<String> {
     let info = d.workflow_execution_info.as_ref()?;
     let attrs = info.search_attributes.as_ref()?;
