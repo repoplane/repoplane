@@ -520,9 +520,17 @@ async fn selectors(s: &Suite) -> anyhow::Result<()> {
     } else {
         // Without a connection named the listing is not refused: it counts what the forge
         // cannot say, with the reason, and a name that rules a repository out is not counted.
-        let all = s.stack.api_get("/v1/repositories?limit=1000").await?;
-        anyhow::ensure!(all["next_cursor"].is_null(), "more than 1000 repositories");
-        let active = all["items"].as_array().map_or(0, |i| i.len());
+        // The ado sandbox holds more than a page (1,000) of repositories: count them all.
+        let mut active = 0;
+        let mut path = "/v1/repositories?limit=1000".to_string();
+        loop {
+            let page = s.stack.api_get(&path).await?;
+            active += page["items"].as_array().map_or(0, |i| i.len());
+            match page["next_cursor"].as_str() {
+                Some(c) => path = format!("/v1/repositories?limit=1000&cursor={c}"),
+                None => break,
+            }
+        }
         let v = s.stack.api_get("/v1/repositories?topic=node").await?;
         anyhow::ensure!(
             v["items"].as_array().is_some_and(|i| i.is_empty()),
